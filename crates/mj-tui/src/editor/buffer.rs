@@ -50,6 +50,11 @@ pub struct Buffer {
     text: Rope,
     /// 光标的字节偏移。永远落在 grapheme 边界上。
     cursor: usize,
+    /// 选区的另一端（锚点）。None = 无选区。
+    ///
+    /// 存锚点而非 (start, end)：用户可以从任一端往回选，
+    /// 而「哪端是起点」正是 Shift+方向键要保留的信息。
+    anchor: Option<usize>,
     undo: Vec<UndoGroup>,
     redo: Vec<UndoGroup>,
     undo_depth: usize,
@@ -64,12 +69,43 @@ impl Buffer {
         Self {
             text: Rope::from_str(text),
             cursor: 0,
+            anchor: None,
             undo: Vec::new(),
             redo: Vec::new(),
             undo_depth: undo_depth.max(1),
             dirty: false,
             changed_chars: 0,
         }
+    }
+
+    // ---- 选区（§6.4：选中文本时状态栏切为「选中 N 字」）----
+
+    /// 开始/延续选区：记下锚点（若尚无）。Shift+方向键调用。
+    pub fn start_selection(&mut self) {
+        if self.anchor.is_none() {
+            self.anchor = Some(self.cursor);
+        }
+    }
+
+    /// 清除选区。普通方向键、插入等调用。
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// 当前选区的字节区间（有序）。无选区或空选区返回 None。
+    pub fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let a = self.anchor?;
+        let (lo, hi) = if a <= self.cursor {
+            (a, self.cursor)
+        } else {
+            (self.cursor, a)
+        };
+        (lo < hi).then_some(lo..hi)
+    }
+
+    /// 选中的文本。
+    pub fn selected_text(&self) -> Option<String> {
+        self.selection().map(|r| self.slice_to_string(r))
     }
 
     pub fn text(&self) -> &Rope {
@@ -219,6 +255,8 @@ impl Buffer {
         self.push_undo(change, kind);
         self.redo.clear(); // 新编辑作废重做栈
         self.dirty = true;
+        // 文本变了，选区的坐标随之失效——留着它只会高亮到错的地方。
+        self.anchor = None;
     }
 
     /// 施加到 rope 上并移动光标。
@@ -667,6 +705,97 @@ mod tests {
                 b.cursor()
             );
         }
+    }
+
+    // ---- 选区 ----
+
+    #[test]
+    fn selection_spans_from_anchor_to_cursor() {
+        let mut b = buf("雪落了一夜");
+        b.move_to(0);
+        b.start_selection();
+        b.move_right();
+        b.move_right();
+        assert_eq!(b.selected_text().as_deref(), Some("雪落"));
+    }
+
+    /// 从右往左选同样成立——用户会两个方向都用。
+    #[test]
+    fn selection_works_backwards() {
+        let mut b = buf("雪落了一夜");
+        b.move_to(6); // 「了」之前
+        b.start_selection();
+        b.move_left();
+        b.move_left();
+        assert_eq!(b.selected_text().as_deref(), Some("雪落"));
+    }
+
+    #[test]
+    fn no_selection_without_anchor() {
+        let mut b = buf("雪落");
+        b.move_right();
+        assert!(b.selection().is_none());
+        assert!(b.selected_text().is_none());
+    }
+
+    /// 锚点与光标重合 = 空选区，应视为无选区（否则状态栏会显示「选中 0 字」）。
+    #[test]
+    fn empty_selection_is_none() {
+        let mut b = buf("雪落");
+        b.move_to(0);
+        b.start_selection();
+        assert!(b.selection().is_none(), "未移动光标时不该有选区");
+    }
+
+    #[test]
+    fn start_selection_is_idempotent() {
+        let mut b = buf("雪落了");
+        b.move_to(0);
+        b.start_selection();
+        b.move_right();
+        b.start_selection(); // 再次调用不该重置锚点
+        b.move_right();
+        assert_eq!(
+            b.selected_text().as_deref(),
+            Some("雪落"),
+            "锚点应保持在起点"
+        );
+    }
+
+    #[test]
+    fn clear_selection_removes_it() {
+        let mut b = buf("雪落");
+        b.move_to(0);
+        b.start_selection();
+        b.move_right();
+        b.clear_selection();
+        assert!(b.selection().is_none());
+    }
+
+    /// 编辑后选区必须失效——文本变了，旧坐标会高亮到错的地方。
+    #[test]
+    fn editing_clears_selection() {
+        let mut b = buf("雪落");
+        b.move_to(0);
+        b.start_selection();
+        b.move_right();
+        assert!(b.selection().is_some());
+        b.insert("新");
+        assert!(b.selection().is_none(), "编辑后选区应失效");
+    }
+
+    /// 选区按 grapheme 对齐：不该选中半个 emoji。
+    #[test]
+    fn selection_respects_graphemes() {
+        let mut b = buf("👨‍👩‍👧雪");
+        b.move_to(0);
+        b.start_selection();
+        b.move_right();
+        assert_eq!(
+            b.selected_text().as_deref(),
+            Some("👨‍👩‍👧"),
+            "应整体选中 ZWJ 家族"
+        );
     }
 
     #[test]

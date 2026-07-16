@@ -150,6 +150,24 @@ impl Index {
             })
     }
 
+    /// 某章的净字数（不含标点）。
+    ///
+    /// front matter 只缓存含标点的 `words`（§5.2），净字数只在索引里——
+    /// 故统计面板要显示双口径时得走这里。
+    pub fn chapter_no_punct(&self, ch: ChapterId) -> rusqlite::Result<Option<u64>> {
+        self.db
+            .query_row(
+                "SELECT words_no_punct FROM chapter_index WHERE chapter_id = ?1",
+                [ch.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| Some(v as u64))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+    }
+
     /// 全书字数汇总。
     pub fn book_totals(&self, book: BookId) -> rusqlite::Result<BookTotals> {
         self.db.query_row(

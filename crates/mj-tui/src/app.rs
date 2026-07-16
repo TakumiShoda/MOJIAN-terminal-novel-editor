@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::shelf::{Shelf, format_words};
+use crate::screens::stats::{self, Stats};
 use crate::screens::tree::{Row, Tree};
 
 /// §7.2：目录树宽度默认 24 列。
@@ -45,6 +46,12 @@ struct Workspace {
     focus: Focus,
     /// 侧栏是否显示（Ctrl+B 切换，§7.3）。
     show_tree: bool,
+    /// 统计面板（F3）。Some = 正在显示。
+    ///
+    /// M1/M2 尚无浮层栈（§7.1 的 `Vec<Modal>` 属 M6），故先用一个
+    /// Option 表示。M6 接入浮层栈时这里会并进去——但那不该拖着
+    /// §6.4 的 [MUST] 一起等。
+    stats: Option<Stats>,
 }
 
 impl Workspace {
@@ -127,7 +134,62 @@ impl App {
                 None
             }
         };
+        self.reindex_book(book);
         self.refresh_today_words(book);
+    }
+
+    /// 补齐索引：正文变了（或索引刚重建）的章重新统计。
+    ///
+    /// 靠 `content_hash` 判断（§5.4）：哈希没变就跳过，故这不是每次开书都
+    /// 全量重算——只有第一次、或用户在外部改过文件时才读正文。
+    /// 这也是「索引删掉能自动重建」的实现（§6.1 验收：手动丢进 books/ 的书能识别）。
+    fn reindex_book(&mut self, book: BookId) {
+        let Some(idx) = &self.index else { return };
+        let Ok(b) = self.store.load_book(book) else {
+            return;
+        };
+
+        let mut changed = 0usize;
+        for v in &b.volumes {
+            for c in &v.chapters {
+                // 受损章不读（ADR 0004）。
+                if c.damaged.is_some() {
+                    continue;
+                }
+                let Ok(body) = self.store.load_body(book, c.id) else {
+                    continue;
+                };
+                let text = body.text.to_string();
+                let hash = mj_core::index::content_hash(&text);
+
+                // 哈希一致 → 索引是新的，跳过。
+                if idx.chapter_hash(c.id).ok().flatten().as_deref() == Some(hash.as_str()) {
+                    continue;
+                }
+
+                let wc = mj_text::count::count(&text);
+                let entry = mj_core::index::ChapterEntry {
+                    chapter: c.id,
+                    book,
+                    volume: v.id.to_string(),
+                    title: c.title.clone(),
+                    order: c.order,
+                    path: c.path.clone(),
+                    content_hash: hash,
+                    words_with_punct: wc.with_punct as u64,
+                    words_no_punct: wc.no_punct as u64,
+                    han_chars: wc.han as u64,
+                    updated: chrono::Local::now().timestamp(),
+                };
+                if let Err(e) = idx.upsert_chapter(&entry) {
+                    tracing::warn!(error = %e, "索引写入失败");
+                }
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            tracing::info!(chapters = changed, "已补齐索引");
+        }
     }
 
     /// 从索引读今日码字量。
@@ -228,6 +290,7 @@ impl App {
             editor: None,
             focus: Focus::Tree,
             show_tree: true,
+            stats: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -244,8 +307,22 @@ impl App {
     // ---- 工作区 ----
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // 统计面板打开时它吃掉所有按键（浮层语义，§7.1）。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.stats.is_some()) {
+            return self.on_key_stats(code);
+        }
+
         // 先处理全局键。
         match code {
+            // F3 打开统计面板（§6.4 [MUST]）。
+            // §7.3 的键位表没给它分配键——F5/F7/F8 已被排版/校对/历史占用，
+            // F3 空着且相邻，故取之。M6 做命令面板时会有正式入口。
+            KeyCode::F(3) => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.stats = Some(Stats::new());
+                }
+                return Ok(());
+            }
             KeyCode::Char('b') if mods.contains(KeyModifiers::CONTROL) => {
                 if let Screen::Workspace(ws) = &mut self.screen {
                     ws.show_tree = !ws.show_tree;
@@ -278,6 +355,68 @@ impl App {
         match focus {
             Focus::Tree => self.on_key_tree(code, mods),
             Focus::Editor => self.on_key_editor(code, mods),
+        }
+    }
+
+    /// 统计面板的按键（§6.4）。
+    fn on_key_stats(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // 导出前先把数据备好——借用检查不允许在持有 ws 的同时调 self 的方法。
+        let export = matches!(code, KeyCode::Char('e'));
+        if export {
+            return self.export_csv();
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(stats) = &mut ws.stats else {
+            return Ok(());
+        };
+
+        match code {
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('q') => ws.stats = None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                let rows = Stats::rows(&ws.book, |_| 0).len();
+                stats.scroll_down(rows, 20);
+            }
+            KeyCode::Up | KeyCode::Char('k') => stats.scroll_up(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 导出统计 CSV（§6.4 [MUST]）。
+    fn export_csv(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let np = self.no_punct_lookup();
+        let csv = stats::to_csv(&ws.book, np);
+
+        // 落在 workspace 根目录，名字带书名与日期——用户要能一眼认出是哪份。
+        let name = format!(
+            "{}-字数统计-{}.csv",
+            mj_core::slug::slugify(&ws.book.title),
+            chrono::Local::now().format("%Y%m%d")
+        );
+        let path = self.store.workspace().root().join(&name);
+
+        // 走原子写：导出中途断电不该留下半截 CSV（§0 禁令 1 的同源原则）。
+        mj_core::atomic::write(&path, csv.as_bytes())?;
+        self.toast = Some(format!("已导出 {name}"));
+        Ok(())
+    }
+
+    /// 各章净字数的查表函数（取自索引）。
+    ///
+    /// front matter 只缓存了含标点的 `words`（§5.2），净字数在索引里。
+    /// 索引不可用时返回 0——统计面板不该因为缓存没了就打不开。
+    fn no_punct_lookup(&self) -> impl Fn(ChapterId) -> u64 + '_ {
+        move |ch| {
+            self.index
+                .as_ref()
+                .and_then(|i| i.chapter_no_punct(ch).ok().flatten())
+                .unwrap_or(0)
         }
     }
 
@@ -330,7 +469,13 @@ impl App {
         let mut edited = false;
         match code {
             KeyCode::Esc => {
-                ws.focus = Focus::Tree;
+                // 有选区时 Esc 先取消选择，再按才回树——
+                // 否则「取消选择」这个最常见的动作没有键可用。
+                if open.buffer.selection().is_some() {
+                    open.buffer.clear_selection();
+                } else {
+                    ws.focus = Focus::Tree;
+                }
                 return Ok(());
             }
             KeyCode::Char('z') if _mods.contains(KeyModifiers::CONTROL) => {
@@ -369,10 +514,34 @@ impl App {
                 open.buffer.delete_forward();
                 edited = true;
             }
-            KeyCode::Left => open.buffer.move_left(),
-            KeyCode::Right => open.buffer.move_right(),
-            KeyCode::Home => open.buffer.move_home(),
-            KeyCode::End => open.buffer.move_end(),
+            // Shift+方向键：延续选区（§6.4 [MUST] 选中时状态栏切为「选中 N 字」）。
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+                if _mods.contains(KeyModifiers::SHIFT) =>
+            {
+                open.buffer.start_selection();
+                match code {
+                    KeyCode::Left => open.buffer.move_left(),
+                    KeyCode::Right => open.buffer.move_right(),
+                    KeyCode::Home => open.buffer.move_home(),
+                    _ => open.buffer.move_end(),
+                }
+            }
+            KeyCode::Left => {
+                open.buffer.clear_selection();
+                open.buffer.move_left();
+            }
+            KeyCode::Right => {
+                open.buffer.clear_selection();
+                open.buffer.move_right();
+            }
+            KeyCode::Home => {
+                open.buffer.clear_selection();
+                open.buffer.move_home();
+            }
+            KeyCode::End => {
+                open.buffer.clear_selection();
+                open.buffer.move_end();
+            }
             KeyCode::Up => open.viewport.scroll_up(1),
             KeyCode::Down => open.viewport.scroll_down(1, &open.buffer),
             _ => {}
@@ -559,6 +728,14 @@ impl App {
         self.render(frame);
     }
 
+    /// 供测试与截图：打开统计面板。
+    #[doc(hidden)]
+    pub fn open_stats_for_demo(&mut self) {
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.stats = Some(Stats::new());
+        }
+    }
+
     /// 供测试与截图：打开书架上的第一本书。
     #[doc(hidden)]
     pub fn open_first_book_for_demo(&mut self) -> anyhow::Result<()> {
@@ -575,9 +752,20 @@ impl App {
         let [body, status] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
+        // 统计面板打开时占满正文区（浮层语义）。
+        let stats_rows = match &self.screen {
+            Screen::Workspace(ws) if ws.stats.is_some() => {
+                Some(Stats::rows(&ws.book, self.no_punct_lookup()))
+            }
+            _ => None,
+        };
+
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
-            Screen::Workspace(ws) => render_workspace(frame, body, ws),
+            Screen::Workspace(ws) => match (&ws.stats, stats_rows) {
+                (Some(st), Some(rows)) => render_stats(frame, body, st, &rows, &ws.book.title),
+                _ => render_workspace(frame, body, ws),
+            },
         }
         self.render_status(frame, status);
     }
@@ -593,7 +781,27 @@ impl App {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
                 }
+                Screen::Workspace(ws) if ws.stats.is_some() => {
+                    spans.push(Span::raw(" 统计面板 │ e 导出 CSV │ ↑↓ 滚动 │ Esc 关闭 "));
+                }
                 Screen::Workspace(ws) => {
+                    // §6.4 [MUST]：选中文本时状态栏切为「选中 N 字」。
+                    // 选区是临时状态，此刻用户关心的是「我选了多少」，
+                    // 而不是本章/本卷/全书那一串常驻数字。
+                    if let Some(sel) = ws.editor.as_ref().and_then(|o| o.buffer.selected_text()) {
+                        let n = mj_text::count::count_with_punct(&sel);
+                        spans.push(Span::styled(
+                            format!(" 选中 {} 字 ", format_words(n as u64)),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                        spans.push(Span::raw("│ Esc 取消选择 "));
+                        frame.render_widget(
+                            Paragraph::new(Line::from(spans)).style(Style::default().reversed()),
+                            area,
+                        );
+                        return;
+                    }
+
                     // §6.4 状态栏：本章 3,128 / 净 2,904 | 本卷 4.2万 | 全书 21.7万 | 今日 +1,240
                     if let Some(open) = &ws.editor {
                         let wc = open.word_count;
@@ -640,7 +848,7 @@ impl App {
                         }
                         spans.push(Span::raw(" "));
                     }
-                    spans.push(Span::raw("│ Ctrl+S 保存 │ Esc 返回 "));
+                    spans.push(Span::raw("│ Ctrl+S 保存 │ F3 统计 │ Esc 返回 "));
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
                     if frame.area().width < NARROW_THRESHOLD {
@@ -722,6 +930,44 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) 
         render_tree(frame, ta, ws);
     }
     render_editor(frame, editor_area, ws);
+}
+
+/// 统计面板（§6.4 [MUST]：按卷/章列出双口径字数，可导出 CSV）。
+fn render_stats(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    stats: &Stats,
+    rows: &[stats::StatRow],
+    book_title: &str,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" 统计 · 《{book_title}》 "))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let text = Stats::render_rows(rows);
+    let h = inner.height as usize;
+
+    let lines: Vec<Line> = text
+        .iter()
+        .skip(stats.scroll())
+        .take(h)
+        .zip(rows.iter().skip(stats.scroll()))
+        .map(|(t, r)| {
+            let style = match r {
+                stats::StatRow::Volume { .. } => Style::default().add_modifier(Modifier::BOLD),
+                stats::StatRow::Total { .. } => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                stats::StatRow::Chapter { .. } => Style::default(),
+            };
+            Line::styled(t.clone(), style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace) {
