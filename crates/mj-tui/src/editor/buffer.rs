@@ -1,0 +1,645 @@
+//! 编辑缓冲：ropey + grapheme 光标 + 撤销栈。见 doc.md §6.3。
+//!
+//! 这一层不含任何渲染，只管「文本怎么变」——故可被完整单元测试。
+//! 视口与绘制在 `view.rs`。
+//!
+//! 三条 `[MUST]`（§6.3）：
+//! - ropey 作缓冲，插入/删除不整段重建字符串；
+//! - 光标按 grapheme 移动（§0 禁令 5）；
+//! - 撤销栈按操作类型 + 时间间隔（默认 500ms）合并成组，栈深默认 500。
+
+use std::time::{Duration, Instant};
+
+use ropey::Rope;
+
+/// 撤销组的合并间隔（§6.3 默认 500ms）。
+const COALESCE_WINDOW: Duration = Duration::from_millis(500);
+
+/// 一次可撤销的编辑。
+#[derive(Debug, Clone, PartialEq)]
+struct Change {
+    /// 起始字节偏移。
+    at: usize,
+    /// 被删除的文本（撤销时要还原它）。
+    removed: String,
+    /// 插入的文本。
+    inserted: String,
+    /// 编辑前的光标位置，撤销时恢复到这里。
+    cursor_before: usize,
+}
+
+/// 编辑的种类。相邻的同类编辑才可能合并成一个撤销组。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Insert,
+    Delete,
+    /// 排版、批量替换等：**永不合并**，一次算一个撤销组（§6.3）。
+    Bulk,
+}
+
+#[derive(Debug)]
+struct UndoGroup {
+    changes: Vec<Change>,
+    kind: Kind,
+    /// 组内最后一次编辑的时刻，用于判断是否还能继续合并。
+    last_edit: Instant,
+}
+
+/// 文本缓冲。
+pub struct Buffer {
+    text: Rope,
+    /// 光标的字节偏移。永远落在 grapheme 边界上。
+    cursor: usize,
+    undo: Vec<UndoGroup>,
+    redo: Vec<UndoGroup>,
+    undo_depth: usize,
+    /// 自上次保存以来是否有改动。
+    dirty: bool,
+    /// 自上次保存以来累计变更的字数，用于触发自动保存（§6.3）。
+    changed_chars: usize,
+}
+
+impl Buffer {
+    pub fn new(text: &str, undo_depth: usize) -> Self {
+        Self {
+            text: Rope::from_str(text),
+            cursor: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            undo_depth: undo_depth.max(1),
+            dirty: false,
+            changed_chars: 0,
+        }
+    }
+
+    pub fn text(&self) -> &Rope {
+        &self.text
+    }
+
+    /// 取出全文。
+    ///
+    /// 不叫 `to_string`：那会与 `ToString` trait 撞名，调用方无从分辨拿到的是哪个。
+    /// 名字也该提醒代价——大章节下这是一次全文拷贝，别在热路径里调。
+    pub fn contents(&self) -> String {
+        self.text.to_string()
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn changed_chars(&self) -> usize {
+        self.changed_chars
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.text.len_bytes()
+    }
+
+    /// 标记已保存。自动保存与手动保存后调用。
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+        self.changed_chars = 0;
+    }
+
+    /// 取整个缓冲的字符串（用于保存/统计）。避免频繁调用——大章节开销不小。
+    fn slice_to_string(&self, range: std::ops::Range<usize>) -> String {
+        let start = self.text.byte_to_char(range.start);
+        let end = self.text.byte_to_char(range.end);
+        self.text.slice(start..end).to_string()
+    }
+
+    // ---- 编辑 ----
+
+    /// 在光标处插入文本。
+    pub fn insert(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.apply(
+            Change {
+                at: self.cursor,
+                removed: String::new(),
+                inserted: s.to_owned(),
+                cursor_before: self.cursor,
+            },
+            Kind::Insert,
+        );
+    }
+
+    /// 删除光标前的一个 grapheme（Backspace）。
+    pub fn delete_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev = self.prev_boundary(self.cursor);
+        let removed = self.slice_to_string(prev..self.cursor);
+        self.apply(
+            Change {
+                at: prev,
+                removed,
+                inserted: String::new(),
+                cursor_before: self.cursor,
+            },
+            Kind::Delete,
+        );
+    }
+
+    /// 删除光标后的一个 grapheme（Delete）。
+    pub fn delete_forward(&mut self) {
+        let next = self.next_boundary(self.cursor);
+        if next == self.cursor {
+            return;
+        }
+        let removed = self.slice_to_string(self.cursor..next);
+        self.apply(
+            Change {
+                at: self.cursor,
+                removed,
+                inserted: String::new(),
+                cursor_before: self.cursor,
+            },
+            Kind::Delete,
+        );
+    }
+
+    /// 替换一个区间。用于排版/批量替换——**永不与相邻编辑合并**（§6.3）。
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, with: &str) {
+        let removed = self.slice_to_string(range.clone());
+        self.apply(
+            Change {
+                at: range.start,
+                removed,
+                inserted: with.to_owned(),
+                cursor_before: self.cursor,
+            },
+            Kind::Bulk,
+        );
+    }
+
+    fn apply(&mut self, change: Change, kind: Kind) {
+        self.edit(&change);
+        self.push_undo(change, kind);
+        self.redo.clear(); // 新编辑作废重做栈
+        self.dirty = true;
+    }
+
+    /// 施加到 rope 上并移动光标。
+    fn edit(&mut self, c: &Change) {
+        let at_char = self.text.byte_to_char(c.at);
+        if !c.removed.is_empty() {
+            let end = self.text.byte_to_char(c.at + c.removed.len());
+            self.text.remove(at_char..end);
+        }
+        if !c.inserted.is_empty() {
+            self.text.insert(at_char, &c.inserted);
+        }
+        self.cursor = c.at + c.inserted.len();
+        self.changed_chars += mj_text::width::grapheme_count(&c.inserted)
+            .max(mj_text::width::grapheme_count(&c.removed));
+    }
+
+    fn push_undo(&mut self, change: Change, kind: Kind) {
+        let now = Instant::now();
+
+        // 能否并入上一组：同类、非 Bulk、且在合并窗口内。
+        let can_coalesce = matches!(self.undo.last(), Some(g)
+            if g.kind == kind
+                && kind != Kind::Bulk
+                && now.duration_since(g.last_edit) < COALESCE_WINDOW);
+
+        if can_coalesce && let Some(g) = self.undo.last_mut() {
+            g.changes.push(change);
+            g.last_edit = now;
+            return;
+        }
+
+        self.undo.push(UndoGroup {
+            changes: vec![change],
+            kind,
+            last_edit: now,
+        });
+
+        // 栈深上限：淘汰最旧的。
+        // 撤销栈与版本历史是两套机制（§6.3）——历史由快照负责，
+        // 这里丢掉最旧的组不影响用户回退到昨天的稿子。
+        while self.undo.len() > self.undo_depth {
+            self.undo.remove(0);
+        }
+    }
+
+    /// 撤销一组。
+    pub fn undo(&mut self) -> bool {
+        let Some(group) = self.undo.pop() else {
+            return false;
+        };
+        // 逆序回放：后发生的先撤销。
+        for c in group.changes.iter().rev() {
+            self.revert(c);
+        }
+        if let Some(first) = group.changes.first() {
+            self.cursor = first.cursor_before;
+        }
+        self.redo.push(group);
+        self.dirty = true;
+        true
+    }
+
+    /// 重做一组。
+    pub fn redo(&mut self) -> bool {
+        let Some(group) = self.redo.pop() else {
+            return false;
+        };
+        for c in &group.changes {
+            self.edit(c);
+        }
+        self.undo.push(group);
+        self.dirty = true;
+        true
+    }
+
+    /// 撤销单条：把 inserted 拿掉，把 removed 放回。
+    fn revert(&mut self, c: &Change) {
+        let at_char = self.text.byte_to_char(c.at);
+        if !c.inserted.is_empty() {
+            let end = self.text.byte_to_char(c.at + c.inserted.len());
+            self.text.remove(at_char..end);
+        }
+        if !c.removed.is_empty() {
+            self.text.insert(at_char, &c.removed);
+        }
+        self.cursor = c.at + c.removed.len();
+    }
+
+    // ---- 光标（一律按 grapheme，§0 禁令 5）----
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.prev_boundary(self.cursor);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = self.next_boundary(self.cursor);
+    }
+
+    pub fn move_to(&mut self, byte: usize) {
+        self.cursor = self.clamp_to_boundary(byte);
+    }
+
+    pub fn move_home(&mut self) {
+        self.cursor = self.line_start(self.cursor);
+    }
+
+    pub fn move_end(&mut self) {
+        self.cursor = self.line_end(self.cursor);
+    }
+
+    /// 当前光标所在的逻辑行号（0 起）。
+    pub fn cursor_line(&self) -> usize {
+        self.text.byte_to_line(self.cursor)
+    }
+
+    fn line_start(&self, byte: usize) -> usize {
+        let line = self.text.byte_to_line(byte);
+        self.text.line_to_byte(line)
+    }
+
+    fn line_end(&self, byte: usize) -> usize {
+        let line = self.text.byte_to_line(byte);
+        let next = self
+            .text
+            .line_to_byte((line + 1).min(self.text.len_lines()));
+        // 去掉行尾换行符本身。
+        let s = self.slice_to_string(self.line_start(byte)..next);
+        next - (s.len() - s.trim_end_matches('\n').len())
+    }
+
+    /// 光标所在逻辑行的字节区间。
+    ///
+    /// grapheme 判定以**行**为窗口，而不是「光标附近 N 字节」：
+    /// grapheme cluster 没有长度上限（ZWJ emoji 家族就有 18 字节，
+    /// 旗帜、肤色修饰符还能更长），任何固定窗口都是在赌它够大——
+    /// 赌输了就会切在 cluster 中间，offset 跑出边界并 panic。
+    /// 而 grapheme 永远不跨行，所以行是天然安全的窗口。
+    ///
+    /// 代价：单行极长（如导入的未分段文本）时窗口也大。但那是 M3 `line_join`
+    /// 要处理的问题，且换行本就是段落边界，不会退化成「整章一行」的常态。
+    fn line_span(&self, byte: usize) -> std::ops::Range<usize> {
+        let line = self.text.byte_to_line(byte);
+        let start = self.text.line_to_byte(line);
+        let end = if line + 1 < self.text.len_lines() {
+            self.text.line_to_byte(line + 1)
+        } else {
+            self.text.len_bytes()
+        };
+        start..end
+    }
+
+    fn next_boundary(&self, byte: usize) -> usize {
+        let span = self.line_span(byte);
+        if byte >= span.end {
+            return byte.min(self.text.len_bytes());
+        }
+        let line = self.slice_to_string(span.clone());
+        let rel = byte - span.start;
+        span.start + mj_text::width::next_grapheme_boundary(&line, rel)
+    }
+
+    fn prev_boundary(&self, byte: usize) -> usize {
+        let span = self.line_span(byte);
+        // 已在行首：退到上一行的行尾（跨过换行符）。
+        if byte == span.start {
+            return byte.saturating_sub(1).min(self.text.len_bytes());
+        }
+        let line = self.slice_to_string(span.clone());
+        let rel = byte - span.start;
+        span.start + mj_text::width::prev_grapheme_boundary(&line, rel)
+    }
+
+    /// 把任意字节位置向下取整到 **grapheme** 边界。
+    ///
+    /// 注意不能只用 `try_byte_to_char`——那只保证落在 *char* 边界上，
+    /// 而组合字符 `e`+`U+0301` 的中间正是一个合法的 char 边界，
+    /// 光标停在那里会把一个字看成两个（§0 禁令 5）。
+    fn floor_boundary(&self, byte: usize) -> usize {
+        let byte = byte.min(self.text.len_bytes());
+        let span = self.line_span(byte);
+        if byte <= span.start {
+            return span.start;
+        }
+        let line = self.slice_to_string(span.clone());
+        let rel = byte - span.start;
+
+        // 从行首逐个 grapheme 前进，找到不超过 rel 的最大边界。
+        let mut last = 0usize;
+        for (off, g) in mj_text::width::grapheme_offsets(&line) {
+            if off >= rel {
+                break;
+            }
+            last = off;
+            if off + g.len() > rel {
+                break; // rel 落在这个 cluster 内部
+            }
+            last = off + g.len();
+        }
+        span.start + last
+    }
+
+    fn clamp_to_boundary(&self, byte: usize) -> usize {
+        self.floor_boundary(byte.min(self.text.len_bytes()))
+    }
+
+    /// 该字节位置是否是 grapheme 边界。供测试断言不变量用。
+    #[cfg(test)]
+    fn is_char_boundary(&self, byte: usize) -> bool {
+        byte == self.floor_boundary(byte)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn buf(s: &str) -> Buffer {
+        Buffer::new(s, 500)
+    }
+
+    #[test]
+    fn inserts_at_cursor() {
+        let mut b = buf("");
+        b.insert("雪");
+        b.insert("落");
+        assert_eq!(b.contents(), "雪落");
+        assert_eq!(b.cursor(), 6, "光标应在两个中文字之后");
+    }
+
+    #[test]
+    fn deletes_backward_by_grapheme() {
+        let mut b = buf("");
+        b.insert("雪落");
+        b.delete_backward();
+        assert_eq!(b.contents(), "雪", "应整字删除，不留半个字节");
+    }
+
+    /// 组合字符必须整体删除——否则会留下孤立的组合符，显示成乱码。
+    #[test]
+    fn deletes_combining_char_as_one() {
+        let mut b = buf("");
+        b.insert("e\u{301}");
+        b.delete_backward();
+        assert_eq!(b.contents(), "", "e+组合符应一次删净");
+    }
+
+    #[test]
+    fn deletes_emoji_family_as_one() {
+        let mut b = buf("");
+        b.insert("👨‍👩‍👧");
+        b.delete_backward();
+        assert_eq!(b.contents(), "", "ZWJ 家族应一次删净");
+    }
+
+    #[test]
+    fn delete_forward_works() {
+        let mut b = buf("雪落");
+        b.move_to(0);
+        b.delete_forward();
+        assert_eq!(b.contents(), "落");
+    }
+
+    #[test]
+    fn deletes_at_edges_are_noops() {
+        let mut b = buf("雪");
+        b.move_to(0);
+        b.delete_backward();
+        assert_eq!(b.contents(), "雪", "开头 Backspace 应无操作");
+        b.move_to(3);
+        b.delete_forward();
+        assert_eq!(b.contents(), "雪", "结尾 Delete 应无操作");
+    }
+
+    #[test]
+    fn cursor_moves_by_grapheme() {
+        let mut b = buf("雪a落");
+        b.move_to(0);
+        b.move_right();
+        assert_eq!(b.cursor(), 3);
+        b.move_right();
+        assert_eq!(b.cursor(), 4);
+        b.move_left();
+        assert_eq!(b.cursor(), 3);
+    }
+
+    #[test]
+    fn cursor_saturates_at_ends() {
+        let mut b = buf("雪");
+        b.move_to(0);
+        b.move_left();
+        assert_eq!(b.cursor(), 0);
+        b.move_to(3);
+        b.move_right();
+        assert_eq!(b.cursor(), 3);
+    }
+
+    #[test]
+    fn home_end_work_on_logical_line() {
+        let mut b = buf("第一行\n第二行");
+        b.move_to(12); // 第二行中间
+        b.move_home();
+        assert_eq!(b.cursor(), 10, "应到第二行行首");
+        b.move_end();
+        assert_eq!(b.cursor(), 19, "应到第二行行尾");
+    }
+
+    #[test]
+    fn end_excludes_newline() {
+        let mut b = buf("第一行\n第二行");
+        b.move_to(0);
+        b.move_end();
+        assert_eq!(b.cursor(), 9, "行尾应在换行符之前");
+    }
+
+    // ---- 撤销 ----
+
+    #[test]
+    fn undo_restores_previous_text() {
+        let mut b = buf("");
+        b.insert("雪落了一夜");
+        assert!(b.undo());
+        assert_eq!(b.contents(), "");
+    }
+
+    #[test]
+    fn redo_reapplies() {
+        let mut b = buf("");
+        b.insert("雪");
+        b.undo();
+        assert!(b.redo());
+        assert_eq!(b.contents(), "雪");
+    }
+
+    #[test]
+    fn undo_on_empty_stack_is_false() {
+        let mut b = buf("雪");
+        assert!(!b.undo(), "空栈撤销应返回 false 而非 panic");
+        assert!(!b.redo());
+    }
+
+    /// 连续输入合并成一组：撤销一次应退掉整串，而不是一个字。
+    #[test]
+    fn consecutive_inserts_coalesce() {
+        let mut b = buf("");
+        b.insert("雪");
+        b.insert("落");
+        b.insert("了");
+        assert!(b.undo());
+        assert_eq!(b.contents(), "", "三次连续输入应合并为一组");
+    }
+
+    /// 插入与删除不同类，不得合并。
+    #[test]
+    fn insert_and_delete_do_not_coalesce() {
+        let mut b = buf("");
+        b.insert("雪落");
+        b.delete_backward();
+        assert_eq!(b.contents(), "雪");
+        b.undo();
+        assert_eq!(b.contents(), "雪落", "撤销应只退掉删除");
+        b.undo();
+        assert_eq!(b.contents(), "", "再撤销才退掉插入");
+    }
+
+    /// §6.3：排版/批量替换算**一个**撤销组，且永不与相邻编辑合并。
+    #[test]
+    fn bulk_edit_is_its_own_group() {
+        let mut b = buf("雪落了");
+        b.insert("x");
+        b.replace_range(0..1, "Y");
+        b.undo();
+        assert!(b.contents().starts_with('x'), "批量编辑应独立成组");
+    }
+
+    #[test]
+    fn new_edit_clears_redo_stack() {
+        let mut b = buf("");
+        b.insert("雪");
+        b.undo();
+        b.insert("落");
+        assert!(!b.redo(), "新编辑后重做栈应清空");
+    }
+
+    /// 栈深上限：超出后丢最旧的，但不得 panic、不得丢当前文本。
+    #[test]
+    fn undo_depth_is_bounded() {
+        let mut b = Buffer::new("", 3);
+        for i in 0..10 {
+            // 用 Bulk 保证每次都独立成组（Insert 会被合并）。
+            let at = b.len_bytes();
+            b.replace_range(at..at, &i.to_string());
+        }
+        assert_eq!(b.contents(), "0123456789");
+        let mut count = 0;
+        while b.undo() {
+            count += 1;
+        }
+        assert_eq!(count, 3, "栈深应受限为 3");
+    }
+
+    #[test]
+    fn dirty_flag_tracks_edits() {
+        let mut b = buf("");
+        assert!(!b.is_dirty());
+        b.insert("雪");
+        assert!(b.is_dirty());
+        b.mark_saved();
+        assert!(!b.is_dirty());
+        assert_eq!(b.changed_chars(), 0);
+    }
+
+    /// 累计变更字数用于触发自动保存（§6.3：累计 200 字）。
+    #[test]
+    fn tracks_changed_chars_for_autosave() {
+        let mut b = buf("");
+        b.insert("雪落了一夜");
+        assert_eq!(b.changed_chars(), 5);
+        b.delete_backward();
+        assert_eq!(b.changed_chars(), 6, "删除也算变更");
+    }
+
+    /// 撤销后文本必须逐字回到原样——含中文与组合字符。
+    #[test]
+    fn undo_roundtrip_preserves_cjk() {
+        let original = "　　雪落了一夜。他推开门。";
+        let mut b = buf(original);
+        b.move_to(b.len_bytes());
+        b.insert("风裹着雪灌进来。");
+        b.undo();
+        assert_eq!(b.contents(), original, "撤销后应逐字还原");
+    }
+
+    /// 光标永远落在 grapheme 边界——否则 rope 操作会 panic。
+    #[test]
+    fn cursor_always_on_boundary() {
+        let mut b = buf("雪👨‍👩‍👧落");
+        b.move_to(0);
+        for _ in 0..10 {
+            b.move_right();
+            assert!(
+                b.is_char_boundary(b.cursor()),
+                "光标 {} 不在字符边界",
+                b.cursor()
+            );
+        }
+    }
+
+    #[test]
+    fn move_to_snaps_to_boundary() {
+        let mut b = buf("雪落");
+        b.move_to(1); // 「雪」的中间
+        assert_eq!(b.cursor(), 0, "应向下取整到边界");
+    }
+}

@@ -48,6 +48,11 @@ pub fn grapheme_count(s: &str) -> usize {
     s.graphemes(true).count()
 }
 
+/// 逐个 grapheme 及其起始字节偏移。
+pub fn grapheme_offsets(s: &str) -> impl Iterator<Item = (usize, &str)> {
+    s.grapheme_indices(true)
+}
+
 /// 把段落按显示宽度折成若干行，遵守中文禁则（§6.3）。
 ///
 /// `width` 为可用列数。返回每行的**字节区间**，便于映射回原文（光标定位需要）。

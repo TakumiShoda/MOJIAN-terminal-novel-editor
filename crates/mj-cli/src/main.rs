@@ -93,13 +93,14 @@ fn run_tui(ws: &Workspace) -> anyhow::Result<()> {
     // 单实例锁：两个实例同写一份稿子必然互相覆盖（doc.md §9）。
     let _lock = WorkspaceLock::acquire(&ws.lock_file())?;
 
-    let _config = Config::load(&ws.config_file())?;
+    let config = Config::load(&ws.config_file())?;
 
     // panic hook 必须在起窗之前装——起窗之后到装 hook 之间若 panic，终端就废了。
     let dump = mj_tui::CrashDump::new();
     mj_tui::panic::install(ws.crash_dir(), dump.clone());
 
-    mj_tui::run()
+    let store = mj_core::Store::new(ws.clone(), config.clone());
+    mj_tui::app::run(store, config)
 }
 
 /// `mj config check`：校验并打印生效值（doc.md §8）。

@@ -1555,6 +1555,7 @@ dependencies = [
  "insta",
  "mj-core",
  "mj-text",
+ "proptest",
  "ratatui",
  "ropey",
  "serde",
