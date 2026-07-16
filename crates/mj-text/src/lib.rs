@@ -4,6 +4,7 @@
 //! 这是为了让排版幂等性、统计一致性能被 proptest 大规模验证。
 
 pub mod count;
+pub mod eol;
 pub mod format;
 pub mod proof;
 pub mod search;

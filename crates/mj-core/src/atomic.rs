@@ -42,10 +42,15 @@ pub fn write(target: &Path, bytes: &[u8]) -> Result<()> {
         f.sync_all().map_err(io_err(&tmp))?;
     }
 
+    // Windows 上 rename 覆盖已存在文件同样可行：std 走的是
+    // `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`（已核对 std 源码，非想当然）。
+    // 故此处无需为 Windows 单开「先删再改名」的分支——那反而会制造一个
+    // 「文件已删、改名未成」的丢稿窗口。
     std::fs::rename(&tmp, target).map_err(io_err(target))?;
 
     // rename 本身也要落盘，否则目录项可能还在页缓存里。
-    // Windows 无法 open 目录做 fsync，此步在该平台跳过。
+    // Windows 无法 open 目录做 fsync，此步在该平台跳过：
+    // NTFS 的元数据日志已提供等价保证。
     #[cfg(unix)]
     {
         let d = std::fs::File::open(dir).map_err(io_err(dir))?;

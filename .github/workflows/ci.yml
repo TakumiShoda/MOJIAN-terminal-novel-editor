@@ -17,6 +17,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # git 在 Windows 上默认 autocrlf=true，会把仓库里的 \n 换成 \r\n。
+      # 那会让 EOL 归一化的测试测的是 git 的行为而不是我们的代码。
+      - name: 关闭 git 的行尾转换
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:

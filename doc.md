@@ -819,7 +819,7 @@ font_size = 14
 
 **日志**：`tracing` → `logs/mj.log`（按天轮转，保留 7 天）。`RUST_LOG` 可调级别。TUI 期间零 stdout 输出。
 
-**跨平台**：Linux / macOS 一等支持；Windows（Windows Terminal）尽力支持，路径与 CRLF 需处理（`[MUST]` 读入时统一 LF，写出按配置 `line_ending = "lf" | "native"`）。
+**跨平台**：Linux / macOS 一等支持；Windows（Windows Terminal）支持（已确认为目标平台，见 ADR 0003），路径与 CRLF 需处理（`[MUST]` 读入时统一 LF，写出按配置 `line_ending = "lf" | "native"`）。`[MUST]` CI 在三平台跑全量测试；`[MUST]` 一切由用户标题派生的路径分量走 `slug::slugify`（Windows 保留字符/设备名/结尾点空格）。
 
 **可访问性**：`[SHOULD]` 高对比主题；`[MUST]` 所有功能不依赖鼠标；`[SHOULD]` 鼠标可选支持（点击树、拖分隔条、滚轮）。
 
@@ -923,6 +923,8 @@ mj doctor                   # 探测终端能力（truecolor/字体/键盘协议
 ### 12.5 待你确认的开放问题
 
 1. 是否需要**大纲/伏笔追踪**（章节级的伏笔埋设与回收标记 + 未回收提醒）？这是长篇最常见的缺失项，但会引入新的数据结构与视图。
-2. 目标平台是否包含 Windows？包含的话 M0 就要处理 CRLF 与路径，不要留到最后。
+2. ~~目标平台是否包含 Windows？~~ **已确认：包含。** CRLF 与路径已在 M0 处理完毕，
+   见 ADR 0003。行尾契约（读入归一化 LF / 写出按 `[general] line_ending`）与
+   跨平台安全的 slug 生成均已落地，CI 在 windows-latest 上跑全量测试。
 3. 云同步的期待是什么？当前设计对 git 友好但不内置 git；若需要开箱即用的同步，需要在 M6 后追加一个 `mj sync` 模块。
 4. 导出格式的优先级：投稿 txt / 发布平台粘贴 / epub 自阅，哪个先做？

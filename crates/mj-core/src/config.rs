@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use mj_text::eol::LineEnding;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -33,6 +34,11 @@ pub struct General {
     /// 码字量按凌晨 N 点切日（写作者常见作息，doc.md §6.4）。
     pub day_starts_at: u8,
     pub keymap: String,
+    /// 正文写出时的行尾（doc.md §9）。读入永远归一化为 LF，故此项只影响写出。
+    ///
+    /// 默认 `lf` 而非 `native`：正文要对 git 友好，且同一份稿子在不同平台间
+    /// 传递不应产生「整文件都变了」的假 diff。Windows 用户需要 CRLF 时显式设 `native`。
+    pub line_ending: LineEnding,
     #[serde(flatten)]
     pub extra: toml::Table,
 }
@@ -42,6 +48,7 @@ impl Default for General {
         Self {
             day_starts_at: 4,
             keymap: "modeless".into(),
+            line_ending: LineEnding::Lf,
             extra: toml::Table::new(),
         }
     }
@@ -182,6 +189,40 @@ mod tests {
         let back = toml::to_string(&c).unwrap();
         assert!(back.contains("future_knob"), "未知字段被吃掉了:\n{back}");
         assert!(back.contains("future_section"), "未知表被吃掉了:\n{back}");
+    }
+
+    /// doc.md §9：`line_ending = "lf" | "native"`。默认 lf。
+    #[test]
+    fn parses_line_ending_knob() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let default = Config::load(&dir.path().join("missing.toml")).unwrap();
+        assert_eq!(default.general.line_ending, LineEnding::Lf, "默认应为 lf");
+
+        for (text, want) in [
+            ("[general]\nline_ending = \"lf\"\n", LineEnding::Lf),
+            ("[general]\nline_ending = \"native\"\n", LineEnding::Native),
+        ] {
+            let p = dir.path().join("c.toml");
+            std::fs::write(&p, text).unwrap();
+            assert_eq!(
+                Config::load(&p).unwrap().general.line_ending,
+                want,
+                "解析 {text:?}"
+            );
+        }
+    }
+
+    /// 非法取值必须报错，不能静默退回默认——用户会以为设置生效了。
+    #[test]
+    fn rejects_invalid_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[general]\nline_ending = \"crlf\"\n").unwrap();
+        assert!(
+            matches!(Config::load(&p), Err(Error::ConfigParse { .. })),
+            "非法的 line_ending 应报错"
+        );
     }
 
     #[test]

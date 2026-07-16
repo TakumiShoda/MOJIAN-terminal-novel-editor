@@ -22,9 +22,12 @@ tracing.workspace = true
 directories.workspace = true
 chrono.workspace = true
 
-# 单实例锁需要 kill(pid, 0) 探测陈旧锁（src/lock.rs）。
+# 单实例锁需要探测陈旧锁的持有者是否还活着（src/lock.rs）。
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

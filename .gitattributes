@@ -1,0 +1,10 @@
+# 仓库内一律 LF，禁止 git 在 checkout 时做行尾转换。
+#
+# 理由：本项目的 EOL 归一化是核心契约（doc.md §9）。若 git 在 Windows 上把 \n
+# 换成 \r\n，测试测的就是 git 的行为而不是我们的代码，且 fmt 检查会全体失败。
+* text=auto eol=lf
+
+# 二进制/快照文件不做任何转换。
+*.zst binary
+*.sqlite binary
+*.png binary

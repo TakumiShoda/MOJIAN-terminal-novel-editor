@@ -49,9 +49,38 @@ fn process_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-#[cfg(not(unix))]
+/// 进程是否存活。
+///
+/// 只判断「能否打开句柄」是不够的：进程结束后，只要还有句柄未关闭，
+/// `OpenProcess` 仍会成功。必须再查退出码——`STILL_ACTIVE` 才算活着。
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: 传入的 pid 无论是否有效，OpenProcess 都只返回句柄或 NULL，不会 UB。
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // 打不开：进程不存在，或无权限。无权限时按「不存在」处理会误删他人的锁，
+        // 但那需要跨用户共享 workspace——不在设计范围内（§9 单实例锁是本机语义）。
+        return false;
+    }
+
+    let mut code: u32 = 0;
+    // SAFETY: handle 由上面的 OpenProcess 返回且非空；code 是有效的可写指针。
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    // SAFETY: handle 非空且尚未关闭。
+    unsafe { CloseHandle(handle) };
+
+    // STILL_ACTIVE 在 windows-sys 里是裸 i32（不是 newtype），故直接转型。
+    ok != 0 && code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
-    // 非 unix 平台暂无探测手段：保守地认为锁有效（宁可提示用户，也不要覆盖活实例）。
+    // 其余平台无探测手段：保守地认为锁有效（宁可提示用户，也不要覆盖活实例）。
     true
 }
 

@@ -39,6 +39,11 @@ chrono = "0.4"
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+# Windows 上探测进程存活（陈旧锁回收），只取需要的 API。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 insta = "1"
 proptest = "1"
