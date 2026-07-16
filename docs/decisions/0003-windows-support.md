@@ -68,7 +68,7 @@ Windows 上创建失败——而这是完全正常的中文标题。
 
 目录 fsync 在 Windows 上跳过（无法 open 目录），依赖 NTFS 元数据日志。
 
-## 验证状态（诚实记录）
+## 验证状态
 
 - **已本地验证**：EOL 归一化 10 项单元测试 + 5 项 proptest 属性（幂等、无 CR 残留、
   往返稳定、行数守恒、非行尾字符不变）；slug 12 项测试；`line_ending` 配置项解析
@@ -76,10 +76,26 @@ Windows 上创建失败——而这是完全正常的中文标题。
 - **已交叉验证**：`lock.rs` 的 Windows 分支用 `--target x86_64-pc-windows-msvc`
   单独类型检查通过。此举当场抓到一个真错误：`STILL_ACTIVE` 在 windows-sys 里是
   裸 `i32` 而非 newtype，我原先写的 `.0` 无法编译——只读代码是发现不了的。
-- **未能本地验证**：整个 workspace 无法在 macOS 上交叉编译到 Windows——
-  zstd 与 rusqlite 的 C 代码需要 Windows SDK 头文件。**Windows 上的真实行为
-  只能由 CI（windows-latest）证明**，本地不具备该能力。这是本 ADR 最大的
-  未验证面，不应假装它已被覆盖。
+- **已由 CI 兑现（2026-07-16）**：windows-latest 上 fmt / clippy / **125 项测试全部通过**。
+  本 ADR 原先记录的最大未验证面——「Windows 上的真实行为只能由 CI 证明」——已兑现：
+  原子写（`MoveFileExW` 覆盖语义）、`OpenProcess` 陈旧锁探测、EOL 归一化、
+  slug 路径安全，均在真实 Windows 上跑通。
+
+### CI 首次运行抓到的问题（值得记录）
+
+首次推送时 windows-latest **失败**，但失败原因不在上述任何一处，而是
+clippy `result_large_err`：`Error` 枚举因内嵌 96 字节的 `toml::de::Error`
+达到 120 字节，Windows 的 `PathBuf` 更大，把它顶过了 128 字节阈值——
+macOS 上不报，Windows 上报。
+
+这不是「Windows 特有问题」：`Result<T>` 至少和 `Error` 一样大，意味着
+mj-core 里每一次**成功**返回都在搬运这些字节。成本两个平台都存在，
+只是 Windows 先报出来。故装箱（120 → 56 字节）而非放宽 lint，
+并把上限固化为 `tests/size.rs`，让这类问题在本机就被拦住。
+
+教训：跨平台的差异不只在 API，也在类型布局；「本机 clippy 干净」不等于
+「CI 干净」。另注意 clippy 失败会让 test 步骤被 skip——首次运行时
+Windows 测试根本没跑，若只看「CI 红了」而不看是哪一步红的，很容易误判。
 
 ## 后续对 M1 的约束
 
