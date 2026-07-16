@@ -11,6 +11,7 @@ pub mod lock;
 pub mod model;
 pub mod slug;
 pub mod store;
+pub mod swap;
 pub mod workspace;
 
 pub use error::{Error, Result};

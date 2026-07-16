@@ -345,7 +345,15 @@ impl Store {
         file.meta.updated = Some(crate::now_rfc3339());
         file.meta.words = Some(mj_text::count::count_han_and_punct(&file.body) as u64);
 
-        self.write_chapter_file(&path, &file)
+        self.write_chapter_file(&path, &file)?;
+
+        // 正文已安全落盘，swp 使命完成。留着它下次启动会误报「有未保存的改动」，
+        // 而狼来了喊多了，真出事时用户就不看了。
+        // 删除失败不影响本次保存——正文已经安全，残留的 swp 下次比对内容后会被清掉。
+        if let Err(e) = crate::swap::remove(&path) {
+            tracing::warn!(path = %path.display(), error = %e, "清理 swp 失败");
+        }
+        Ok(())
     }
 
     /// 序列化并原子写。行尾按配置转换（ADR 0003）。
@@ -433,6 +441,10 @@ impl Store {
     ///
     /// 走目录扫描而非缓存：文件可能被用户在外部改名/移动（§1 纯文本为真相，
     /// 用户拿 git 或记事本操作是被鼓励的），缓存会失效，磁盘不会。
+    pub fn chapter_file_path(&self, book: BookId, ch: ChapterId) -> Result<PathBuf> {
+        self.find_chapter_path(book, ch)
+    }
+
     fn find_chapter_path(&self, book: BookId, ch: ChapterId) -> Result<PathBuf> {
         let b = self.load_book(book)?;
         for v in &b.volumes {

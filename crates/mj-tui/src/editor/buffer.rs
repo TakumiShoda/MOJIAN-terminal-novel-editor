@@ -106,6 +106,14 @@ impl Buffer {
         self.changed_chars = 0;
     }
 
+    /// 标记为「有未落盘的改动」。
+    ///
+    /// 专供崩溃恢复：从 swp 灌回来的内容与磁盘不一致，虽然用户没敲过键，
+    /// 但它确实未保存——状态栏必须显示「未保存」，否则用户以为已经安全了。
+    pub fn mark_dirty_for_recovery(&mut self) {
+        self.dirty = true;
+    }
+
     /// 取整个缓冲的字符串（用于保存/统计）。避免频繁调用——大章节开销不小。
     fn slice_to_string(&self, range: std::ops::Range<usize>) -> String {
         let start = self.text.byte_to_char(range.start);
@@ -129,6 +137,31 @@ impl Buffer {
             },
             Kind::Insert,
         );
+    }
+
+    /// 插入一对符号，光标停在两者之间（§6.3 中文输入辅助）。
+    ///
+    /// 与「插入两个字符再左移」不同：这是**一次**编辑，撤销时整对一起消失。
+    /// 用户敲一次 `「`，撤销一次就该回到敲之前——而不是留下半个 `」`。
+    pub fn insert_pair(&mut self, open: char, close: char) {
+        let mut s = String::with_capacity(open.len_utf8() + close.len_utf8());
+        s.push(open);
+        s.push(close);
+        self.insert(&s);
+        // 光标退回到两者之间。
+        self.cursor -= close.len_utf8();
+    }
+
+    /// 光标右侧的第一个字符（供成对符号判断上下文）。
+    pub fn next_char(&self) -> Option<char> {
+        let span = self.line_span(self.cursor);
+        if self.cursor >= span.end {
+            return None;
+        }
+        self.slice_to_string(self.cursor..span.end)
+            .chars()
+            .next()
+            .filter(|c| *c != '\n')
     }
 
     /// 删除光标前的一个 grapheme（Backspace）。

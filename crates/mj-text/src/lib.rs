@@ -6,6 +6,7 @@
 pub mod count;
 pub mod eol;
 pub mod format;
+pub mod pair;
 pub mod proof;
 pub mod search;
 pub mod width;

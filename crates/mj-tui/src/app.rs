@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::editor::{Buffer, Viewport};
+use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::tree::{Row, Tree};
@@ -51,6 +51,12 @@ struct OpenChapter {
     id: ChapterId,
     buffer: Buffer,
     viewport: Viewport,
+    autosave: AutoSave,
+    /// 章节文件的绝对路径。缓存它是因为 swp 每 500ms 就要写一次，
+    /// 而由 id 反查路径要扫整本书的目录——那太贵了。
+    /// 代价：用户在程序运行期间从外部移动了文件，swp 会写到旧位置。
+    /// 可接受：正文的保存路径仍走 Store 的实时反查，swp 只是保险丝。
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +108,8 @@ impl App {
                 }
                 AppEvent::Term(Event::Resize(_, _)) => self.dirty = true,
                 AppEvent::Term(_) => {}
-                AppEvent::Tick => {}
+                // 自动保存的心跳（§7.4：Tick 驱动自动保存计时）。
+                AppEvent::Tick => self.on_tick()?,
             }
         }
         Ok(())
@@ -267,15 +274,48 @@ impl App {
             return Ok(());
         };
 
+        let mut edited = false;
         match code {
             KeyCode::Esc => {
                 ws.focus = Focus::Tree;
                 return Ok(());
             }
-            KeyCode::Char(c) => open.buffer.insert(&c.to_string()),
-            KeyCode::Enter => open.buffer.insert("\n"),
-            KeyCode::Backspace => open.buffer.delete_backward(),
-            KeyCode::Delete => open.buffer.delete_forward(),
+            KeyCode::Char('z') if _mods.contains(KeyModifiers::CONTROL) => {
+                open.buffer.undo();
+                edited = true;
+            }
+            KeyCode::Char('y') if _mods.contains(KeyModifiers::CONTROL) => {
+                open.buffer.redo();
+                edited = true;
+            }
+            KeyCode::Char(c) => {
+                // 中文输入辅助（§6.3）：「→「」、（→（）、《→《》，可关。
+                if self.config.editor.auto_pair {
+                    match mj_text::pair::on_input(c, open.buffer.next_char()) {
+                        mj_text::pair::PairAction::InsertPair(o, cl) => {
+                            open.buffer.insert_pair(o, cl)
+                        }
+                        // 光标右边就是要敲的右符号 → 越过去，不插重复的。
+                        mj_text::pair::PairAction::Skip(_) => open.buffer.move_right(),
+                        mj_text::pair::PairAction::Insert(c) => open.buffer.insert(&c.to_string()),
+                    }
+                } else {
+                    open.buffer.insert(&c.to_string());
+                }
+                edited = true;
+            }
+            KeyCode::Enter => {
+                open.buffer.insert("\n");
+                edited = true;
+            }
+            KeyCode::Backspace => {
+                open.buffer.delete_backward();
+                edited = true;
+            }
+            KeyCode::Delete => {
+                open.buffer.delete_forward();
+                edited = true;
+            }
             KeyCode::Left => open.buffer.move_left(),
             KeyCode::Right => open.buffer.move_right(),
             KeyCode::Home => open.buffer.move_home(),
@@ -283,6 +323,9 @@ impl App {
             KeyCode::Up => open.viewport.scroll_up(1),
             KeyCode::Down => open.viewport.scroll_down(1, &open.buffer),
             _ => {}
+        }
+        if edited {
+            open.autosave.on_edit(std::time::Instant::now());
         }
         open.viewport.scroll_to_cursor(&open.buffer);
         Ok(())
@@ -296,13 +339,87 @@ impl App {
             return Ok(());
         };
         let body = self.store.load_body(ws.book.id, id)?;
-        let buffer = Buffer::new(&body.text.to_string(), self.config.editor.undo_depth);
+        let saved = body.text.to_string();
+        let path = self.store.chapter_file_path(ws.book.id, id)?;
+
+        // 崩溃恢复（§6.3）：swp 里若有比磁盘更新的内容，先救回来。
+        //
+        // M1 采取「自动恢复 + 明确告知」而非弹窗询问：浮层栈是 M6 的内容，
+        // 而在此之前若默默丢掉 swp，就等于让崩溃前的字白写——那是 §0 禁令 1
+        // 要防的事。恢复后正文进入 dirty 状态，用户可 Ctrl+Z 退回磁盘版本。
+        let (text, recovered) = match mj_core::swap::detect(&path, &saved)? {
+            Some(r) if r.differs() => (r.swap_body, true),
+            Some(_) => {
+                // 与磁盘一致 = 上次正常退出的残留，静默清理。
+                let _ = mj_core::swap::remove(&path);
+                (saved, false)
+            }
+            None => (saved, false),
+        };
+
+        let mut buffer = Buffer::new(&text, self.config.editor.undo_depth);
+        if recovered {
+            // 标脏：恢复出来的内容尚未落盘，状态栏要显示「未保存」。
+            buffer.mark_dirty_for_recovery();
+            self.toast = Some(format!(
+                "已从崩溃恢复文件找回未保存的内容（{} 字），Ctrl+S 保存或 Ctrl+Z 撤销",
+                mj_text::count::count_with_punct(&buffer.contents())
+            ));
+        }
+
         ws.editor = Some(OpenChapter {
             id,
             buffer,
             viewport: Viewport::new(40, 20), // 真实尺寸在渲染时校正
+            autosave: AutoSave::new(
+                self.config.editor.autosave_idle_ms,
+                self.config.editor.autosave_words,
+            ),
+            path,
         });
         ws.tree.focus_chapter(&ws.book, id);
+        Ok(())
+    }
+
+    /// Tick 驱动的自动保存（§6.3、§7.4）。
+    fn on_tick(&mut self) -> anyhow::Result<()> {
+        let now = std::time::Instant::now();
+
+        let action = {
+            let Screen::Workspace(ws) = &mut self.screen else {
+                return Ok(());
+            };
+            let Some(open) = &mut ws.editor else {
+                return Ok(());
+            };
+            open.autosave
+                .poll(now, open.buffer.is_dirty(), open.buffer.changed_chars())
+        };
+
+        match action {
+            Action::Idle => {}
+            Action::WriteSwap => {
+                let Screen::Workspace(ws) = &self.screen else {
+                    return Ok(());
+                };
+                let Some(open) = &ws.editor else {
+                    return Ok(());
+                };
+                // swp 写失败不该打断写作——它是保险丝，不是主路径。记日志即可。
+                if let Err(e) = mj_core::swap::write(&open.path, &open.buffer.contents()) {
+                    tracing::warn!(error = %e, "写 swp 失败");
+                }
+            }
+            Action::Save => {
+                self.save_current()?;
+                if let Screen::Workspace(ws) = &mut self.screen
+                    && let Some(open) = &mut ws.editor
+                {
+                    open.autosave.on_saved();
+                }
+                self.dirty = true; // 状态栏要从「未保存」变回「已保存」
+            }
+        }
         Ok(())
     }
 
@@ -318,8 +435,11 @@ impl App {
         }
 
         let body = ChapterBody::new(open.id, open.buffer.contents());
+        // save_body 内部会清掉 swp——正文既已落盘，swp 留着只会下次误报。
         self.store.save_body(ws.book.id, &body)?;
         open.buffer.mark_saved();
+        // 手动保存同样要重置自动保存的计时，否则它还以为欠着一次保存。
+        open.autosave.on_saved();
 
         // 保存后重载元数据，让树上的字数跟上。
         ws.book = self.store.load_book(ws.book.id)?;
