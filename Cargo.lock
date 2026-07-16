@@ -1541,6 +1541,7 @@ dependencies = [
  "serde_json",
  "similar",
  "thiserror 2.0.18",
+ "tracing",
  "unicode-general-category",
  "unicode-segmentation",
  "unicode-width",

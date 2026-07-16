@@ -1,0 +1,18 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fc933a0ca3bf63e851b3a8f4959755ab18286b167a6568429612004413912606 # shrinks to text = "--"
+cc 89440f414dd48646e8087896d41bfb06a044169daf03b4ac34189a26c96fde96 # shrinks to text = "a", opts = FormatOptions { trim_trailing: false, collapse_blank: false, paragraph_indent: FullWidthTwo, unify_ellipsis: false, unify_dash: false, punct_to_full_width: false, unify_quotes: false, cjk_latin_space: true, full_width_digits: false, strip_inline_space: false, repeat_punct: false, line_join: false }
+cc 15e44a4bd8837d0c5de73c6419e2a2a061f3a9010e5188dc68a54bca285d2eae # shrinks to text = "--"
+cc f49b77ac5660be19be541c771e1820b3df34c7702268477e5e576e2c644aaf86 # shrinks to text = "２０２６", opts = FormatOptions { trim_trailing: false, collapse_blank: false, paragraph_indent: FullWidthTwo, unify_ellipsis: false, unify_dash: false, punct_to_full_width: false, unify_quotes: false, cjk_latin_space: true, full_width_digits: true, strip_inline_space: false, repeat_punct: false, line_join: false }
+cc 4cb324cf45a65546930498384c41fa1e8feb6528652822e0bbb7b2255f78841b # shrinks to text = "!  ", opts = FormatOptions { trim_trailing: false, collapse_blank: false, paragraph_indent: FullWidthTwo, unify_ellipsis: false, unify_dash: false, punct_to_full_width: true, unify_quotes: false, cjk_latin_space: false, full_width_digits: false, strip_inline_space: false, repeat_punct: false, line_join: false }
+cc d1c1b6878a4d1d2959f80a6665a322595cfc08e98bba19ac432a6dd0b722c57b # shrinks to text = "a!「", opts = FormatOptions { trim_trailing: false, collapse_blank: false, paragraph_indent: FullWidthTwo, unify_ellipsis: false, unify_dash: false, punct_to_full_width: true, unify_quotes: false, cjk_latin_space: true, full_width_digits: false, strip_inline_space: false, repeat_punct: false, line_join: false }
+cc de047774532dd0522249dae19fdc09f1bfecce4fa7b11845abb59a9dc3756131 # shrinks to text = "雪!  「"
+cc 3f43c47dc6f620d637a1191a14e4daa3d801f62a694ee616b915c9bc978faa44 # shrinks to text = " \n\n"
+cc 8b09239dd9481cef37c2f7657639d89c1f556507f7b7d78d0f47e46d2c0136e8 # shrinks to text = "。 。。。"
+cc 7f3def8ef4a5ce5d59fcba63275c97e0f8ff92d1d0bfc124b18b95a9c0a07518 # shrinks to text = "。  .。-"
+cc e9f0d102b26372833b4ad5a5810d5bf14a86b9f2764cab39f559bdf883b5476a # shrinks to text = "２０２６\u{3000}雪雪——雪"
+cc 3b6c600a177af291b755ba2a88593d65fcea01e32cc4e62eb5b8542bf4fc799a # shrinks to text = "\n\n\t\u{3000}a--(雪..."

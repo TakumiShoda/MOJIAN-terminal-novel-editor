@@ -20,6 +20,9 @@ fancy-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# §6.5 要求规则重叠时「记 warning 日志」。tracing 只是发事件，
+# 不做 IO（写哪去由订阅者决定），不违反 §4 的零 IO 铁律。
+tracing.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
