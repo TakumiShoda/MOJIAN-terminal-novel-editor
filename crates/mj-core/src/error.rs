@@ -19,11 +19,18 @@ pub enum Error {
     #[error("无法确定用户主目录，请用 --workspace 显式指定")]
     NoHomeDir,
 
+    /// `toml::de::Error` 本身就有 96 字节，直接内嵌会把整个 `Error` 撑到
+    /// 120 字节以上——而 `Result<T>` 至少和 `Error` 一样大，意味着**每一次成功的
+    /// 返回**都要搬运这么多字节。故装箱：让常见路径（成功）廉价，
+    /// 罕见路径（解析失败）多一次分配。
+    ///
+    /// 这是 CI 在 Windows 上抓到的：那里 PathBuf 更大，`Error` 越过了 clippy
+    /// `result_large_err` 的 128 字节阈值。本机（macOS）不报，但问题两边都存在。
     #[error("解析配置 {path} 失败")]
     ConfigParse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("workspace 已被进程 {pid} 占用（锁文件 {path}）")]

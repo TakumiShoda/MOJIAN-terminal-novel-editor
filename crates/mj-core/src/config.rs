@@ -142,7 +142,7 @@ impl Config {
         };
         toml::from_str(&text).map_err(|source| Error::ConfigParse {
             path: path.to_owned(),
-            source,
+            source: Box::new(source),
         })
     }
 }

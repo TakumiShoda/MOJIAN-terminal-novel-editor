@@ -120,7 +120,7 @@ impl Store {
         let text = read_to_string(&path)?;
         let bt: BookToml = toml::from_str(&text).map_err(|source| Error::ConfigParse {
             path: path.clone(),
-            source,
+            source: Box::new(source),
         })?;
 
         let mut volumes = self.load_volumes(dir)?;
@@ -168,7 +168,7 @@ impl Store {
         let text = read_to_string(&path)?;
         let vt: VolumeToml = toml::from_str(&text).map_err(|source| Error::ConfigParse {
             path: path.clone(),
-            source,
+            source: Box::new(source),
         })?;
 
         let mut chapters = self.load_chapter_metas(dir)?;
