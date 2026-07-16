@@ -17,6 +17,9 @@ ratatui = "0.30"
 ropey = "1"
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# §6.4 的 no_punct 口径要按 Unicode 类别 P*/S*/Z* 排除，std 无此 API。
+# §3 的依赖表没列——文档要求了一项它没给工具的检查。
+unicode-general-category = "1"
 similar = "2"
 jieba-rs = "0.7"
 regex = "1"

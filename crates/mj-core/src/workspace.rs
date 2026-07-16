@@ -66,6 +66,16 @@ impl Workspace {
         self.root.join(".lock")
     }
 
+    /// 某本书的索引缓存（§5.1：`books/<book-id>/.index.sqlite`）。
+    ///
+    /// 索引放在书目录内而非 workspace 根：这样一本书的目录是自足的，
+    /// 用户整个拷走仍能用（§1 纯文本为真相——他确实会这么干）。
+    pub fn book_index_file(&self, book: crate::id::BookId) -> PathBuf {
+        self.books_dir()
+            .join(book.to_string())
+            .join(".index.sqlite")
+    }
+
     /// 建立标准目录骨架。幂等：已存在不报错。
     pub fn ensure_layout(&self) -> Result<()> {
         for dir in [

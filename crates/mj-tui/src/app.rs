@@ -47,11 +47,28 @@ struct Workspace {
     show_tree: bool,
 }
 
+impl Workspace {
+    /// 当前打开的章所属卷的字数（§6.4 状态栏「本卷 4.2万」）。
+    fn current_volume_words(&self) -> Option<u64> {
+        let ch = self.editor.as_ref()?.id;
+        let (vol, _) = self.book.find_chapter(ch)?;
+        Some(vol.chapters.iter().filter_map(|c| c.word_count).sum())
+    }
+}
+
 struct OpenChapter {
     id: ChapterId,
     buffer: Buffer,
     viewport: Viewport,
     autosave: AutoSave,
+    /// 本章字数缓存。
+    ///
+    /// 必须缓存而非每帧重算：§6.4 要求编辑时单次统计 < 1ms，
+    /// 但状态栏每帧都要显示——10 万字章节下每帧全量统计会直接吃掉
+    /// §9 的 16ms 按键预算。故只在编辑后更新。
+    word_count: mj_text::count::WordCount,
+    /// 上次落盘时的字数，用于算今日码字量的增量（§6.4）。
+    saved_words: usize,
     /// 章节文件的绝对路径。缓存它是因为 swp 每 500ms 就要写一次，
     /// 而由 id 反查路径要扫整本书的目录——那太贵了。
     /// 代价：用户在程序运行期间从外部移动了文件，swp 会写到旧位置。
@@ -68,25 +85,60 @@ enum Focus {
 pub struct App {
     store: Store,
     config: Config,
+    index: Option<mj_core::index::Index>,
     screen: Screen,
     should_quit: bool,
     /// 仅在状态变化时重绘（§7.4：不要固定 60fps 空转）。
     dirty: bool,
     /// 底部提示语，操作后给一句反馈。
     toast: Option<String>,
+    /// 今日净增字数（§6.4）。
+    today_words: i64,
 }
 
 impl App {
     pub fn new(store: Store, config: Config) -> anyhow::Result<Self> {
         let books = store.list_books()?;
+
         Ok(Self {
             store,
             config,
+            // 索引按书打开（§5.1：books/<id>/.index.sqlite），故此处为空。
+            index: None,
             screen: Screen::Shelf(Shelf::new(books)),
             should_quit: false,
             dirty: true,
             toast: None,
+            today_words: 0,
         })
+    }
+
+    /// 打开某书的索引。
+    ///
+    /// 索引是缓存不是真相（§0 禁令 3）：连重建都失败（磁盘满/只读）时
+    /// 降级为 None 继续跑——字数改从元数据现算，搜索慢一点，
+    /// 但绝不能因为一个缓存打不开就让人写不了字。
+    fn open_index(&mut self, book: BookId) {
+        let path = self.store.workspace().book_index_file(book);
+        self.index = match mj_core::index::Index::open(&path) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "索引不可用，降级运行");
+                None
+            }
+        };
+        self.refresh_today_words(book);
+    }
+
+    /// 从索引读今日码字量。
+    fn refresh_today_words(&mut self, book: BookId) {
+        let day =
+            mj_core::index::writing_day(chrono::Local::now(), self.config.general.day_starts_at);
+        self.today_words = self
+            .index
+            .as_ref()
+            .and_then(|i| i.daily_delta(book, &day).ok())
+            .unwrap_or(0);
     }
 
     /// 主循环。
@@ -169,6 +221,7 @@ impl App {
 
     fn open_book(&mut self, id: BookId) -> anyhow::Result<()> {
         let book = self.store.load_book(id)?;
+        self.open_index(id);
         let mut ws = Workspace {
             book,
             tree: Tree::new(),
@@ -326,6 +379,9 @@ impl App {
         }
         if edited {
             open.autosave.on_edit(std::time::Instant::now());
+            // 字数只在编辑后重算，不在每帧渲染时算——后者会让 10 万字章节
+            // 的每次按键都做一遍全量统计，直接吃掉 §9 的 16ms 预算。
+            open.word_count = mj_text::count::count(&open.buffer.contents());
         }
         open.viewport.scroll_to_cursor(&open.buffer);
         Ok(())
@@ -340,6 +396,8 @@ impl App {
         };
         let body = self.store.load_body(ws.book.id, id)?;
         let saved = body.text.to_string();
+        // 磁盘上的字数——今日码字量的基线，必须在 saved 被恢复逻辑消费前取。
+        let saved_words = mj_text::count::count_with_punct(&saved);
         let path = self.store.chapter_file_path(ws.book.id, id)?;
 
         // 崩溃恢复（§6.3）：swp 里若有比磁盘更新的内容，先救回来。
@@ -367,6 +425,7 @@ impl App {
             ));
         }
 
+        let word_count = mj_text::count::count(&buffer.contents());
         ws.editor = Some(OpenChapter {
             id,
             buffer,
@@ -376,6 +435,10 @@ impl App {
                 self.config.editor.autosave_words,
             ),
             path,
+            word_count,
+            // 以磁盘上的字数为基线：从 swp 恢复出来的增量属于「今天写的」，
+            // 保存时才计入今日码字量，而不是打开章节就凭空跳一截。
+            saved_words,
         });
         ws.tree.focus_chapter(&ws.book, id);
         Ok(())
@@ -434,15 +497,57 @@ impl App {
             return Ok(());
         }
 
-        let body = ChapterBody::new(open.id, open.buffer.contents());
+        let text = open.buffer.contents();
+        let body = ChapterBody::new(open.id, &text);
+        let book_id = ws.book.id;
+
         // save_body 内部会清掉 swp——正文既已落盘，swp 留着只会下次误报。
-        self.store.save_body(ws.book.id, &body)?;
+        self.store.save_body(book_id, &body)?;
         open.buffer.mark_saved();
         // 手动保存同样要重置自动保存的计时，否则它还以为欠着一次保存。
         open.autosave.on_saved();
 
+        // 今日码字量：以本次保存的净增累加（§6.4，删改为负）。
+        let wc = mj_text::count::count(&text);
+        let delta = wc.with_punct as i64 - open.saved_words as i64;
+        open.word_count = wc;
+        open.saved_words = wc.with_punct;
+
+        let entry = mj_core::index::ChapterEntry {
+            chapter: open.id,
+            book: book_id,
+            volume: String::new(),
+            title: String::new(),
+            order: 0,
+            path: open.path.clone(),
+            content_hash: mj_core::index::content_hash(&text),
+            words_with_punct: wc.with_punct as u64,
+            words_no_punct: wc.no_punct as u64,
+            han_chars: wc.han as u64,
+            updated: chrono::Local::now().timestamp(),
+        };
+
+        // 索引写失败不该打断保存——正文已经安全了，索引下次重建即可。
+        if let Some(idx) = &self.index {
+            let day = mj_core::index::writing_day(
+                chrono::Local::now(),
+                self.config.general.day_starts_at,
+            );
+            if delta != 0
+                && let Err(e) = idx.add_daily_delta(book_id, &day, delta)
+            {
+                tracing::warn!(error = %e, "记录今日码字量失败");
+            }
+            if let Err(e) = idx.upsert_chapter(&entry) {
+                tracing::warn!(error = %e, "更新索引失败");
+            }
+        }
+        self.refresh_today_words(book_id);
+
         // 保存后重载元数据，让树上的字数跟上。
-        ws.book = self.store.load_book(ws.book.id)?;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.book = self.store.load_book(book_id)?;
+        }
         self.toast = Some("已保存".into());
         Ok(())
     }
@@ -489,17 +594,22 @@ impl App {
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
                 }
                 Screen::Workspace(ws) => {
+                    // §6.4 状态栏：本章 3,128 / 净 2,904 | 本卷 4.2万 | 全书 21.7万 | 今日 +1,240
                     if let Some(open) = &ws.editor {
-                        let words = mj_text::count::count_with_punct(&open.buffer.contents());
-                        spans.push(Span::raw(format!(" 本章 {} ", format_words(words as u64))));
+                        let wc = open.word_count;
+                        spans.push(Span::raw(format!(
+                            " 本章 {} / 净 {} ",
+                            format_words(wc.with_punct as u64),
+                            format_words(wc.no_punct as u64)
+                        )));
                         spans.push(Span::raw("│ "));
-                        if open.buffer.is_dirty() {
-                            spans.push(Span::styled("●未保存", Style::default().fg(Color::Yellow)));
-                        } else {
-                            spans.push(Span::raw("已保存"));
-                        }
-                        spans.push(Span::raw(" │ "));
                     }
+
+                    // 本卷：光标所在卷的字数。
+                    if let Some(vol_words) = ws.current_volume_words() {
+                        spans.push(Span::raw(format!("本卷 {} │ ", format_words(vol_words))));
+                    }
+
                     let total: u64 = ws
                         .book
                         .volumes
@@ -507,8 +617,30 @@ impl App {
                         .flat_map(|v| &v.chapters)
                         .filter_map(|c| c.word_count)
                         .sum();
-                    spans.push(Span::raw(format!("全书 {} ", format_words(total))));
-                    spans.push(Span::raw("│ Ctrl+S 保存 │ Tab 切焦点 │ Esc 返回 "));
+                    spans.push(Span::raw(format!("全书 {} │ ", format_words(total))));
+
+                    // 今日码字量（§6.4）：正负都要显示——删得比写得多是常态，
+                    // 显示成 0 会让人以为统计坏了。
+                    let sign = if self.today_words >= 0 { "+" } else { "" };
+                    spans.push(Span::styled(
+                        format!("今日 {sign}{} ", self.today_words),
+                        Style::default().fg(if self.today_words >= 0 {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ));
+
+                    if let Some(open) = &ws.editor {
+                        spans.push(Span::raw("│ "));
+                        if open.buffer.is_dirty() {
+                            spans.push(Span::styled("●未保存", Style::default().fg(Color::Yellow)));
+                        } else {
+                            spans.push(Span::raw("已保存"));
+                        }
+                        spans.push(Span::raw(" "));
+                    }
+                    spans.push(Span::raw("│ Ctrl+S 保存 │ Esc 返回 "));
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
                     if frame.area().width < NARROW_THRESHOLD {
