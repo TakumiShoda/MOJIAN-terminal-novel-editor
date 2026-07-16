@@ -28,4 +28,19 @@ pub enum Error {
 
     #[error("workspace 已被进程 {pid} 占用（锁文件 {path}）")]
     WorkspaceLocked { pid: u32, path: PathBuf },
+
+    #[error("解析章节文件 {path} 失败：{message}")]
+    ChapterParse { path: PathBuf, message: String },
+
+    #[error("章节文件 {path} 的元数据已损坏，拒绝写入以免覆盖正文：{message}")]
+    ChapterDamaged { path: PathBuf, message: String },
+
+    #[error("找不到章 {id}")]
+    ChapterNotFound { id: crate::id::ChapterId },
+
+    #[error("找不到卷 {id}")]
+    VolumeNotFound { id: crate::id::VolumeId },
+
+    #[error("排序号耗尽——请检查该卷的 order 是否异常")]
+    OrderExhausted,
 }
