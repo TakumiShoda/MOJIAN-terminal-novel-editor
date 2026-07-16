@@ -5,5 +5,9 @@ pub mod editor;
 pub mod event;
 pub mod font;
 pub mod keymap;
+pub mod panic;
 pub mod screens;
 pub mod theme;
+
+pub use app::run;
+pub use panic::CrashDump;
