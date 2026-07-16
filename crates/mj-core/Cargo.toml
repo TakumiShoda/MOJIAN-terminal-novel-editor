@@ -1,0 +1,31 @@
+[package]
+name = "mj-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "领域模型、磁盘存储、索引、版本历史。不依赖 ratatui。"
+
+[dependencies]
+mj-text.workspace = true
+
+ropey.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rusqlite.workspace = true
+zstd.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+directories.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+[package]
+name = "mj-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ratatui 界面层：状态机与渲染，不含业务算法。"
+
+# crossterm 不单独引入：统一走 ratatui 的再导出，避免两个版本共存（doc.md §3）。
+[dependencies]
+mj-core.workspace = true
+mj-text.workspace = true
+
+ratatui.workspace = true
+ropey.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+bitflags.workspace = true
+chrono.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

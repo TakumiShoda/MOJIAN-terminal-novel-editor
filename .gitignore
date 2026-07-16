@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# insta 快照测试的待审查文件
+**/*.snap.new
+
+# criterion 基准输出
+/criterion/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.idea/
+*.swp
+
+# 注意：本文件是「代码仓库」的忽略规则。
+# 用户数据 workspace（~/.local/share/mojian）里的 .index.sqlite 与 history/
+# 由程序自动生成 .gitignore 写入，见 doc.md §5.1 —— 与本文件无关。

@@ -1,0 +1,29 @@
+[package]
+name = "mj-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "纯函数文本处理：字数、排版、查找替换、校对。零 IO、零全局状态。"
+
+# 分层铁律：本 crate 不得依赖任何 IO / TUI crate（见 doc.md §4）。
+# 例外：proof/llm.rs 与 proof/external.rs 的网络与子进程调用由调用方注入，
+# 本 crate 只定义契约与纯规则实现。
+[dependencies]
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+similar.workspace = true
+jieba-rs.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+criterion.workspace = true
+
+[lints]
+workspace = true
