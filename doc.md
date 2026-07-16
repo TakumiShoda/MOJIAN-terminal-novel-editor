@@ -198,22 +198,24 @@ mojian/
 
 ### 5.2 章节文件格式
 
-章节文件是**带 YAML front matter 的纯文本**。正文部分绝不包含任何私有标记——用户拿去别处必须能直接用。
+章节文件是**带 TOML front matter 的纯文本**（原文档写 YAML，但 §3 依赖表里没有 YAML crate 且 serde_yaml 已停止维护；改用 TOML 的理由见 ADR 0004）。正文部分绝不包含任何私有标记——用户拿去别处必须能直接用。
 
 ```markdown
----
-id: ch_7Q2M4KZA
-title: 第一章 雪夜
-status: draft        # draft | revised | done
-created: 2026-07-16T10:00:00+09:00
-updated: 2026-07-16T12:30:00+09:00
-words: 3128          # 缓存值，以实际正文为准，不一致时重算
-tags: [伏笔]
----
++++
+id = "ch_7Q2M4KZA"
+title = "第一章 雪夜"
+status = "draft"        # draft | revised | done
+created = "2026-07-16T10:00:00+09:00"
+updated = "2026-07-16T12:30:00+09:00"
+words = 3128            # 缓存值，以实际正文为准，不一致时重算
+tags = ["伏笔"]
++++
 　　雪落了一夜。
 ```
 
 `[MUST]` 解析器要容忍：无 front matter（视为纯正文，首次保存时补写）、字段缺失（用默认值）、字段多余（保留原样回写，不得丢弃未知字段）。
+
+`[MUST]` front matter 损坏时**不得让章节从目录树上消失**（正文尚在磁盘上，消失会让用户以为稿子丢了）。降级为「受损章」：树上可见并标注原因，`save_body` 拒绝写入以免覆盖可救内容。见 ADR 0004。
 
 ### 5.3 核心类型
 
