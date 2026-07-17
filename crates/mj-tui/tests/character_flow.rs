@@ -213,6 +213,42 @@ fn panel_renders_across_widths() {
     }
 }
 
+/// t 切到出场统计视图；Esc 先回列表，再 Esc 才关面板。
+#[test]
+fn t_toggles_appearance_stats() {
+    let f = setup(&["沈砚"]);
+    let mut app = f.app();
+    open_panel(&mut app);
+    assert_eq!(app.character_stats_open_for_test(), Some(false));
+
+    app.press_for_test(KeyCode::Char('t'), NONE).unwrap();
+    assert_eq!(app.character_stats_open_for_test(), Some(true), "t 进统计");
+
+    // 统计视图里 Esc 回列表（面板还开着）。
+    app.press_for_test(KeyCode::Esc, NONE).unwrap();
+    assert_eq!(
+        app.character_stats_open_for_test(),
+        Some(false),
+        "Esc 回列表"
+    );
+    assert!(app.character_filtered_for_test().is_some(), "面板仍在");
+
+    // 再 Esc 才关面板。
+    app.press_for_test(KeyCode::Esc, NONE).unwrap();
+    assert_eq!(app.character_filtered_for_test(), None);
+}
+
+#[test]
+fn stats_view_renders_across_widths() {
+    let f = setup(&["沈砚", "苏妲己"]);
+    for (w, h) in [(60, 20), (80, 24), (120, 30)] {
+        let mut app = f.app();
+        open_panel(&mut app);
+        app.press_for_test(KeyCode::Char('t'), NONE).unwrap();
+        assert!(draw_ok(&mut app, w, h), "统计视图在 {w}x{h} 撕屏了");
+    }
+}
+
 #[test]
 fn form_renders_across_widths() {
     let f = setup(&["沈砚"]);

@@ -6,6 +6,7 @@
 //! 状态与渲染分离：这里只管「有哪些角色、搜什么、选中谁」，绘制在 app.rs。
 //! 增删改经 Store 落盘后，由 app 重新载入本面板。
 
+use mj_core::appearance::Appearance;
 use mj_core::model::Character;
 
 pub struct CharacterPanel {
@@ -14,6 +15,8 @@ pub struct CharacterPanel {
     query: String,
     /// 搜索框是否有焦点（`/` 进入，Esc/Enter 退出）。
     searching: bool,
+    /// 出场统计视图（`t` 打开，§6.7 [SHOULD]）。Some = 正在看统计。
+    stats: Option<Vec<Appearance>>,
     cursor: usize,
     scroll: usize,
     height: usize,
@@ -25,6 +28,7 @@ impl CharacterPanel {
             all,
             query: String::new(),
             searching: false,
+            stats: None,
             cursor: 0,
             scroll: 0,
             height: 10,
@@ -81,8 +85,52 @@ impl CharacterPanel {
         self.follow_cursor();
     }
 
+    // ---- 出场统计（§6.7 [SHOULD]）----
+
+    /// 是否正在看出场统计。
+    pub fn show_stats(&self) -> bool {
+        self.stats.is_some()
+    }
+
+    /// 载入统计并切到统计视图。已按「消失最久」在前排好。
+    pub fn set_stats(&mut self, mut stats: Vec<Appearance>) {
+        // 长期未出现的浮到前面：chapters_since_last 降序；从未出场的（None）垫底，
+        // 它们是「还没登场」而非「消失」，另算。
+        stats.sort_by(|a, b| {
+            let ka = a.chapters_since_last();
+            let kb = b.chapters_since_last();
+            match (ka, kb) {
+                (Some(x), Some(y)) => y.cmp(&x).then(a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
+        });
+        self.stats = Some(stats);
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    pub fn clear_stats(&mut self) {
+        self.stats = None;
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    pub fn stats(&self) -> Option<&[Appearance]> {
+        self.stats.as_deref()
+    }
+
+    /// 当前视图里可导航的条目数（统计视图或卡片列表）。
+    fn active_len(&self) -> usize {
+        match &self.stats {
+            Some(s) => s.len(),
+            None => self.filtered_count(),
+        }
+    }
+
     pub fn move_down(&mut self) {
-        let n = self.filtered_count();
+        let n = self.active_len();
         if n > 0 {
             self.cursor = (self.cursor + 1).min(n - 1);
         }
@@ -127,6 +175,22 @@ impl CharacterPanel {
         }
     }
 
+    /// 出场统计的一行：`沈砚  128次  最近第12章 · 近5章未出现`。
+    pub fn stat_line(a: &Appearance) -> String {
+        if a.total == 0 {
+            return format!("{}  —  尚未出场", a.name);
+        }
+        let last = a
+            .last
+            .as_ref()
+            .map(|(i, _)| format!("最近第{}章", i + 1))
+            .unwrap_or_default();
+        match a.chapters_since_last() {
+            Some(0) | None => format!("{}  {}次  {last}", a.name, a.total),
+            Some(n) => format!("{}  {}次  {last} · 近{n}章未出现", a.name, a.total),
+        }
+    }
+
     /// 一行摘要，供列表显示：`沈砚（沈公子/小砚）· 主角`。
     pub fn summary_line(c: &Character) -> String {
         let mut s = c.name.clone();
@@ -139,8 +203,18 @@ impl CharacterPanel {
         s
     }
 
+    /// id → 名字，供关系目标解析。
+    fn name_of(&self, id: mj_core::id::CharacterId) -> Option<&str> {
+        self.all
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.as_str())
+    }
+
     /// 选中角色的详情行（右侧/下方展示）。空字段跳过，别撑出一堆空标签。
-    pub fn detail_lines(c: &Character) -> Vec<String> {
+    ///
+    /// 关系目标（`CharacterId`）解析成名字显示；目标已删除则退回显示 id 尾段。
+    pub fn detail_lines(&self, c: &Character) -> Vec<String> {
         let mut v = vec![c.name.clone()];
         if !c.aliases.is_empty() {
             v.push(format!("别名：{}", c.aliases.join("、")));
@@ -172,7 +246,11 @@ impl CharacterPanel {
             v.push(String::new());
             v.push("【关系】".into());
             for r in &c.relations {
-                v.push(format!("· {}", r.label));
+                let target = self
+                    .name_of(r.target)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "（已删除）".to_string());
+                v.push(format!("· {}：{target}", r.label));
             }
         }
         for (k, val) in &c.custom {
@@ -262,10 +340,78 @@ mod tests {
     fn detail_skips_empty_fields() {
         let mut c = ch("沈砚", &[], "");
         c.background = "书香门第".into();
-        let lines = CharacterPanel::detail_lines(&c);
+        let p = CharacterPanel::new(vec![c.clone()]);
+        let lines = p.detail_lines(&c);
         let text = lines.join("\n");
         assert!(text.contains("背景"), "有背景应显示");
         assert!(!text.contains("性别"), "空字段不该出现标签：{text}");
+    }
+
+    #[test]
+    fn detail_resolves_relation_target_names() {
+        use mj_core::model::Relation;
+        let master = ch("师父", &[], "配角");
+        let mut disciple = ch("沈砚", &[], "主角");
+        disciple.relations = vec![Relation {
+            target: master.id,
+            label: "师父".into(),
+        }];
+        let p = CharacterPanel::new(vec![master.clone(), disciple.clone()]);
+        let text = p.detail_lines(&disciple).join("\n");
+        assert!(text.contains("师父：师父"), "关系应解析出目标名：{text}");
+    }
+
+    #[test]
+    fn detail_relation_to_deleted_target_is_graceful() {
+        use mj_core::model::Relation;
+        let mut c = ch("沈砚", &[], "");
+        c.relations = vec![Relation {
+            target: CharacterId::generate(), // 不在列表里 = 已删除
+            label: "旧友".into(),
+        }];
+        let p = CharacterPanel::new(vec![c.clone()]);
+        let text = p.detail_lines(&c).join("\n");
+        assert!(text.contains("旧友：（已删除）"), "{text}");
+    }
+
+    #[test]
+    fn stats_sort_absent_first() {
+        use mj_core::appearance::Appearance;
+        use mj_core::id::CharacterId;
+        let a = |name: &str, last: Option<usize>, total: usize| Appearance {
+            id: CharacterId::generate(),
+            name: name.into(),
+            total,
+            last: last.map(|i| (i, format!("第{}章", i + 1))),
+            total_chapters: 10,
+        };
+        let mut p = CharacterPanel::new(vec![]);
+        // 甲最近第9章(近0章)、乙最近第2章(近7章)、丙从未出场。
+        p.set_stats(vec![
+            a("甲", Some(9), 5),
+            a("乙", Some(2), 3),
+            a("丙", None, 0),
+        ]);
+        let order: Vec<&str> = p.stats().unwrap().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(order, vec!["乙", "甲", "丙"], "消失最久在前，未出场垫底");
+        assert!(p.show_stats());
+        p.clear_stats();
+        assert!(!p.show_stats());
+    }
+
+    #[test]
+    fn stat_line_flags_absence() {
+        use mj_core::appearance::Appearance;
+        use mj_core::id::CharacterId;
+        let absent = Appearance {
+            id: CharacterId::generate(),
+            name: "乙".into(),
+            total: 3,
+            last: Some((2, "第3章".into())),
+            total_chapters: 10,
+        };
+        let line = CharacterPanel::stat_line(&absent);
+        assert!(line.contains("近7章未出现"), "{line}");
     }
 
     #[test]

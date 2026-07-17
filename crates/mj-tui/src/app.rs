@@ -1294,7 +1294,7 @@ impl App {
     }
 
     fn on_key_character(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        // 会写盘的动作先脱离对 ws 的借用。
+        // 会写盘/扫盘的动作先脱离对 ws 的借用。
         match code {
             KeyCode::Char('n') if !self.character_searching() => {
                 return self.new_character();
@@ -1304,6 +1304,10 @@ impl App {
             }
             KeyCode::Char('e') if !self.character_searching() => {
                 return self.edit_character();
+            }
+            // t：出场统计。已在统计视图则收起；否则扫全书算一次（§6.7 [SHOULD]）。
+            KeyCode::Char('t') if !self.character_searching() => {
+                return self.toggle_appearance_stats();
             }
             _ => {}
         }
@@ -1329,11 +1333,37 @@ impl App {
         }
 
         match code {
+            // 统计视图里 Esc/q 先回到卡片列表，再按才关面板。
+            KeyCode::Esc | KeyCode::Char('q') if p.show_stats() => p.clear_stats(),
             KeyCode::Esc | KeyCode::Char('q') => ws.character = None,
-            KeyCode::Char('/') => p.start_search(),
+            KeyCode::Char('/') if !p.show_stats() => p.start_search(),
             KeyCode::Down | KeyCode::Char('j') => p.move_down(),
             KeyCode::Up | KeyCode::Char('k') => p.move_up(),
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// `t`：出场统计视图开关。开时扫全书数每个角色的提及次数。
+    fn toggle_appearance_stats(&mut self) -> anyhow::Result<()> {
+        let showing = matches!(&self.screen, Screen::Workspace(ws) if ws.character.as_ref().is_some_and(|p| p.show_stats()));
+        if showing {
+            if let Screen::Workspace(ws) = &mut self.screen
+                && let Some(p) = &mut ws.character
+            {
+                p.clear_stats();
+            }
+            return Ok(());
+        }
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        let stats = mj_core::appearance::count_appearances(&self.store, book).unwrap_or_default();
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(p) = &mut ws.character
+        {
+            p.set_stats(stats);
         }
         Ok(())
     }
@@ -2343,6 +2373,15 @@ impl App {
         }
     }
 
+    /// 供测试：角色面板是否在出场统计视图（None = 面板没开）。
+    #[doc(hidden)]
+    pub fn character_stats_open_for_test(&self) -> Option<bool> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.character.as_ref().map(|p| p.show_stats()),
+            _ => None,
+        }
+    }
+
     /// 供测试：角色面板当前选中角色的名字。
     #[doc(hidden)]
     pub fn character_current_name_for_test(&self) -> Option<String> {
@@ -2539,12 +2578,14 @@ impl App {
                     }
                 }
                 Screen::Workspace(ws) if ws.character.is_some() => {
-                    let searching = ws.character.as_ref().is_some_and(|p| p.is_searching());
-                    if searching {
+                    let panel = ws.character.as_ref();
+                    if panel.is_some_and(|p| p.is_searching()) {
                         spans.push(Span::raw(" 搜索角色 │ 输入筛选 │ Enter/Esc 结束搜索 "));
+                    } else if panel.is_some_and(|p| p.show_stats()) {
+                        spans.push(Span::raw(" 出场统计 │ j/k 滚动 │ t/Esc 返回列表 "));
                     } else {
                         spans.push(Span::raw(
-                            " 角色 │ j/k 移动 │ / 搜索 │ n 新建 │ e 编辑 │ d 删除 │ Esc 关闭 ",
+                            " 角色 │ j/k 移动 │ / 搜索 │ n 新建 │ e 编辑 │ d 删除 │ t 出场统计 │ Esc 关闭 ",
                         ));
                     }
                 }
@@ -3450,6 +3491,41 @@ fn render_character_form(frame: &mut ratatui::Frame, area: Rect, form: &mut Char
 
 /// 角色速查侧栏 / 列表页（Alt+C，§6.7）。宽屏左列表右详情，窄屏只列表。
 fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPanel) {
+    // 出场统计视图（t 打开，§6.7 [SHOULD]）。
+    if p.show_stats() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" 角色出场统计 · 消失最久在前 ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        p.set_height(inner.height as usize);
+        let (scroll, cursor) = (p.scroll(), p.cursor());
+        let stats = p.stats().unwrap_or(&[]);
+        let lines: Vec<Line> = stats
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(inner.height as usize)
+            .map(|(i, a)| {
+                // 长期未出现的标黄，未出场的压暗。
+                let mut style = if a.total == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else if a.chapters_since_last().is_some_and(|n| n >= 3) {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                if i == cursor {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                Line::styled(CharacterPanel::stat_line(a), style)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
     let title = if p.is_searching() {
         format!(" 角色 · 搜索：{}▏", p.query())
     } else {
@@ -3507,7 +3583,8 @@ fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPa
         let dinner = dblock.inner(da);
         frame.render_widget(dblock, da);
         if let Some(c) = p.current() {
-            let lines: Vec<Line> = CharacterPanel::detail_lines(c)
+            let lines: Vec<Line> = p
+                .detail_lines(c)
                 .into_iter()
                 .take(dinner.height as usize)
                 .map(Line::from)

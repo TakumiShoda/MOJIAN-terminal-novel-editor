@@ -1,5 +1,6 @@
 //! 领域模型、存储、索引、版本历史。见 doc.md §5。
 
+pub mod appearance;
 pub mod atomic;
 pub mod chapter_file;
 pub mod config;

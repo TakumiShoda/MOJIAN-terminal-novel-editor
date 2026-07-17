@@ -202,6 +202,45 @@ fn ignored_issue_is_filtered_out() {
 }
 
 #[test]
+fn appearance_counts_mentions_across_chapters() {
+    let (dir, mut store) = setup();
+    let book = store.create_book("书", "作者").unwrap();
+    let vol = store.create_volume(book.id, "卷一", None).unwrap();
+    let c1 = store.create_chapter(book.id, vol, "第一章", None).unwrap();
+    let c2 = store
+        .create_chapter(book.id, vol, "第二章", Some(c1))
+        .unwrap();
+    let c3 = store
+        .create_chapter(book.id, vol, "第三章", Some(c2))
+        .unwrap();
+    let save = |store: &mut Store, ch, body: &str| {
+        store
+            .save_body(book.id, &mj_core::model::ChapterBody::new(ch, body))
+            .unwrap();
+    };
+    save(&mut store, c1, "沈砚推门，沈砚看雪。\n");
+    save(&mut store, c2, "这一章没有他。\n");
+    save(&mut store, c3, "结尾又见沈砚。\n");
+
+    let mut sy = store.create_character(book.id, "沈砚").unwrap();
+    sy.aliases = vec!["小砚".into()];
+    store.save_character(book.id, &sy).unwrap();
+    store.create_character(book.id, "从未登场").unwrap();
+
+    let (_ws, store) = reopen(&dir);
+    let stats = mj_core::appearance::count_appearances(&store, book.id).unwrap();
+
+    let shen = stats.iter().find(|a| a.name == "沈砚").unwrap();
+    assert_eq!(shen.total, 3, "沈砚共提及 3 次");
+    assert_eq!(shen.last.as_ref().unwrap().0, 2, "最近在第三章");
+    assert_eq!(shen.total_chapters, 3);
+
+    let ghost = stats.iter().find(|a| a.name == "从未登场").unwrap();
+    assert_eq!(ghost.total, 0);
+    assert!(ghost.last.is_none());
+}
+
+#[test]
 fn user_confusion_overrides_builtin() {
     let (_dir, _store) = setup();
     let ws = Workspace::resolve(Some(_dir.path().to_path_buf())).unwrap();
