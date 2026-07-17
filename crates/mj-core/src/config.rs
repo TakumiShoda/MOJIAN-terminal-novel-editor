@@ -91,7 +91,11 @@ impl Default for Editor {
 #[serde(default)]
 pub struct History {
     pub max_per_chapter: usize,
-    pub retention: String,
+    /// `thinned`（默认）| `fifo`。见 §6.9。
+    ///
+    /// 用枚举而非 String：M0 时类型还没有，先占了个 String；现在有了就该换过来——
+    /// 否则配置里写错一个字母会被悄悄当成默认值，用户以为设上了。
+    pub retention: crate::history::Retention,
     pub auto_interval_min: u64,
     pub auto_min_words: usize,
     #[serde(flatten)]
@@ -102,7 +106,7 @@ impl Default for History {
     fn default() -> Self {
         Self {
             max_per_chapter: 40,
-            retention: "thinned".into(),
+            retention: crate::history::Retention::Thinned,
             auto_interval_min: 10,
             auto_min_words: 300,
             extra: toml::Table::new(),
@@ -164,7 +168,7 @@ mod tests {
         let c = Config::load(Path::new("/nonexistent/config.toml")).unwrap();
         assert_eq!(c.general.day_starts_at, 4);
         assert_eq!(c.editor.undo_depth, 500);
-        assert_eq!(c.history.retention, "thinned");
+        assert_eq!(c.history.retention, crate::history::Retention::Thinned);
     }
 
     #[test]

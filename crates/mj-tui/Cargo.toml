@@ -26,6 +26,8 @@ ureq.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
+# 测试里构造 Snapshot 的 extra 字段（透传用的 serde_json::Map）。
+serde_json.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

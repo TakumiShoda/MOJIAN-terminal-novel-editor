@@ -1,6 +1,7 @@
 //! ratatui 界面层。见 doc.md §6.10 / §7。
 
 pub mod app;
+pub mod clipboard;
 pub mod editor;
 pub mod event;
 pub mod font;

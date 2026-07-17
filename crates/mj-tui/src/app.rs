@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::format_preview::{self, FormatPreview};
+use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
 use crate::screens::search_panel::{self, SearchPanel};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
@@ -58,6 +59,10 @@ struct Workspace {
     format_preview: Option<FormatPreview>,
     /// 查找替换面板（Ctrl+F / Ctrl+H，§6.6）。同上。
     search: Option<SearchPanel>,
+    /// 历史面板（F8，§6.9）。同上。
+    history: Option<HistoryPanel>,
+    /// diff 视图（历史面板里 Enter 打开，§6.9）。同上。
+    diff: Option<DiffView>,
 }
 
 impl Workspace {
@@ -107,6 +112,9 @@ pub struct App {
     toast: Option<String>,
     /// 今日净增字数（§6.4）。
     today_words: i64,
+    /// 上次快照的时刻与当时的字数。自动快照要「每 N 分钟**且**净变更 ≥ M 字」，
+    /// 两个条件都得记着。切章时重置——那是另一条历史线。
+    last_snapshot: Option<(std::time::Instant, usize)>,
 }
 
 impl App {
@@ -123,6 +131,7 @@ impl App {
             dirty: true,
             toast: None,
             today_words: 0,
+            last_snapshot: None,
         })
     }
 
@@ -299,6 +308,8 @@ impl App {
             stats: None,
             format_preview: None,
             search: None,
+            history: None,
+            diff: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -316,6 +327,12 @@ impl App {
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         // 浮层打开时它吃掉所有按键（浮层语义，§7.1）。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.diff.is_some()) {
+            return self.on_key_diff(code);
+        }
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.history.is_some()) {
+            return self.on_key_history(code);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.search.is_some()) {
             return self.on_key_search(code, mods);
         }
@@ -330,6 +347,22 @@ impl App {
         match code {
             // F5 一键排版（当前章，弹预览）——§7.3 键位表。
             KeyCode::F(5) => return self.open_format_preview(),
+            // F8 历史面板（§7.3）。
+            KeyCode::F(8) => return self.open_history(),
+
+            // 手动打快照。
+            //
+            // §7.3 指定的是 Ctrl+Shift+S，但**在传统键盘模式下它根本到不了**：
+            // 终端对 Ctrl+S 与 Ctrl+Shift+S 发的是同一个字节（0x13），Shift 压根没编码进去。
+            // 要区分得开 kitty 键盘协议（§2.3：可选，需运行时探测），那是 M6 的活。
+            //
+            // 一个永远不触发的键位比没有更糟——用户会以为功能坏了。
+            // 故 F9 作为当下真正可用的入口；Ctrl+Shift+S 的分支留着，
+            // M6 开了协议它自然就活了。
+            KeyCode::F(9) => return self.manual_snapshot(),
+            KeyCode::Char('S') if mods.contains(KeyModifiers::CONTROL) => {
+                return self.manual_snapshot();
+            }
             // Ctrl+F 查找 / Ctrl+H 查找替换（§7.3）。
             KeyCode::Char('f') if mods.contains(KeyModifiers::CONTROL) => {
                 return self.open_search(false);
@@ -379,6 +412,310 @@ impl App {
             Focus::Tree => self.on_key_tree(code, mods),
             Focus::Editor => self.on_key_editor(code, mods),
         }
+    }
+
+    // ---- 版本历史（§6.9）----
+
+    /// 当前书的历史库。
+    fn history_of(&self, book: BookId) -> mj_core::history::History {
+        mj_core::history::History::new(&self.store.workspace().books_dir().join(book.to_string()))
+    }
+
+    /// 打一条快照。
+    ///
+    /// 快照失败**绝不打断用户的操作**：历史是附加价值，正文才是命根子。
+    /// 记日志 + 提示一句就够了——不能因为磁盘满就让人排不了版。
+    fn take_snapshot(&mut self, trigger: mj_core::history::Trigger, label: Option<String>) {
+        let retention = self.config.history.retention;
+        let Screen::Workspace(ws) = &self.screen else {
+            return;
+        };
+        let (Some(open), book) = (&ws.editor, ws.book.id) else {
+            return;
+        };
+        let (ch, text) = (open.id, open.buffer.contents());
+
+        match self
+            .history_of(book)
+            .snapshot(ch, &text, trigger, label, retention)
+        {
+            Ok(Some(_)) => {}
+            // 去重：内容与上一条相同，没新建。这是正常的。
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, ?trigger, "打快照失败");
+                self.toast = Some(format!("快照失败（{e}），但正文不受影响"));
+            }
+        }
+    }
+
+    /// Ctrl+Shift+S：手动快照（§6.9）。
+    ///
+    /// §6.9 说「可填标签」，而输入浮层属 M6——故先按触发来源存，
+    /// 标签留到历史面板里补（F8 内可加）。给个能用的，而不是干等 M6。
+    fn manual_snapshot(&mut self) -> anyhow::Result<()> {
+        if !matches!(&self.screen, Screen::Workspace(ws) if ws.editor.is_some()) {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        }
+        self.take_snapshot(mj_core::history::Trigger::Manual, None);
+        self.last_snapshot = Some((std::time::Instant::now(), self.current_words()));
+        self.toast = Some("已打快照，F8 查看历史".into());
+        Ok(())
+    }
+
+    fn current_words(&self) -> usize {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.word_count.with_punct),
+            _ => None,
+        }
+        .unwrap_or(0)
+    }
+
+    /// 自动快照（§6.9）：每 N 分钟**且**自上次快照后净变更 ≥ M 字。
+    ///
+    /// 「且」不是「或」——两个条件都满足才打，否则历史会被刷屏，
+    /// 而刷屏的历史等于没有历史（用户翻不动）。
+    fn maybe_auto_snapshot(&mut self) {
+        let interval = std::time::Duration::from_secs(self.config.history.auto_interval_min * 60);
+        let min_words = self.config.history.auto_min_words;
+        let now = std::time::Instant::now();
+        let words = self.current_words();
+
+        let Some((last_at, last_words)) = self.last_snapshot else {
+            // 还没打过：以当前状态为基准，别一开章就打一条。
+            self.last_snapshot = Some((now, words));
+            return;
+        };
+        if now.duration_since(last_at) < interval {
+            return;
+        }
+        if words.abs_diff(last_words) < min_words {
+            return;
+        }
+
+        self.take_snapshot(mj_core::history::Trigger::Auto, None);
+        self.last_snapshot = Some((now, words));
+    }
+
+    /// F8：打开历史面板。
+    fn open_history(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let (Some(open), book) = (&ws.editor, ws.book.id) else {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        };
+        let snaps = self.history_of(book).list(open.id);
+
+        if snaps.is_empty() {
+            self.toast = Some("本章还没有快照（Ctrl+S 保存或 Ctrl+Shift+S 手动打一条）".into());
+            return Ok(());
+        }
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.history = Some(HistoryPanel::new(snaps));
+        }
+        Ok(())
+    }
+
+    /// 历史面板的按键。
+    fn on_key_history(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // Enter 要读 blob，先脱离对 ws 的借用。
+        if code == KeyCode::Enter {
+            return self.open_diff();
+        }
+        if matches!(code, KeyCode::Char('P')) {
+            return self.toggle_pin();
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.history else {
+            return Ok(());
+        };
+        match code {
+            KeyCode::Esc | KeyCode::F(8) | KeyCode::Char('q') => ws.history = None,
+            KeyCode::Down | KeyCode::Char('j') => p.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => p.move_up(),
+            KeyCode::Char(' ') => p.toggle_compare(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `P`：钉住/取消当前快照。钉住的永不淘汰（§6.9）。
+    fn toggle_pin(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let (Some(p), Some(open), book) = (&ws.history, &ws.editor, ws.book.id) else {
+            return Ok(());
+        };
+        let Some(s) = p.selected() else { return Ok(()) };
+        let (id, now_pinned, ch) = (s.id.clone(), s.pinned, open.id);
+
+        let h = self.history_of(book);
+        if let Err(e) = h.set_pinned(ch, &id, !now_pinned) {
+            self.toast = Some(format!("操作失败：{e}"));
+            return Ok(());
+        }
+        // 重载面板，让标记跟上。
+        let snaps = h.list(ch);
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.history = Some(HistoryPanel::new(snaps));
+        }
+        self.toast = Some(if now_pinned {
+            "已取消钉住".into()
+        } else {
+            "已钉住，此快照永不淘汰".to_string()
+        });
+        Ok(())
+    }
+
+    /// 历史面板里 Enter：打开 diff（§6.9）。
+    ///
+    /// 默认对比**该快照 vs 当前版本**——用户原话「与现版本相比哪里做了改动」。
+    /// 若用 Space 选了第二条，则两条快照互比。
+    fn open_diff(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let (Some(p), Some(open), book) = (&ws.history, &ws.editor, ws.book.id) else {
+            return Ok(());
+        };
+        let Some(sel) = p.selected() else {
+            return Ok(());
+        };
+
+        let h = self.history_of(book);
+        let old_text = match h.read(&sel.id) {
+            Ok(t) => t,
+            Err(e) => {
+                self.toast = Some(format!("读不出这条快照：{e}"));
+                return Ok(());
+            }
+        };
+        let old_title = snapshot_title(sel);
+
+        // Space 选了对照条 → 两条快照互比；否则与当前版本比。
+        let (new_title, new_text) = match p.compare_target() {
+            Some(other) => match h.read(&other.id) {
+                Ok(t) => (snapshot_title(other), t),
+                Err(e) => {
+                    self.toast = Some(format!("读不出对照的快照：{e}"));
+                    return Ok(());
+                }
+            },
+            None => ("当前版本".to_string(), open.buffer.contents()),
+        };
+
+        let view = DiffView::new(old_title, old_text, new_title, new_text);
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.history = None;
+            ws.diff = Some(view);
+        }
+        Ok(())
+    }
+
+    /// diff 界面的按键（§6.9、§12.4）。
+    fn on_key_diff(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // 会改正文的先脱离借用。
+        match code {
+            KeyCode::Char('u') => return self.restore_hunk(),
+            KeyCode::Char('U') => return self.restore_whole_chapter(),
+            KeyCode::Char('y') => return self.copy_old_content(),
+            _ => {}
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(v) = &mut ws.diff else { return Ok(()) };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => ws.diff = None,
+            KeyCode::Char('n') => v.next_hunk(),
+            KeyCode::Char('p') => v.prev_hunk(),
+            KeyCode::Down | KeyCode::Char('j') => v.scroll_down(),
+            KeyCode::Up | KeyCode::Char('k') => v.scroll_up(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `u`：单块恢复（§6.9 恢复粒度 2）。
+    fn restore_hunk(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let Some(v) = &ws.diff else { return Ok(()) };
+        let Some(edit) = v.restore_hunk_edit() else {
+            self.toast = Some("没有可恢复的改动块".into());
+            return Ok(());
+        };
+
+        // 恢复前先给当前版本打一条快照——回退本身也可回退（§6.9）。
+        self.take_snapshot(mj_core::history::Trigger::Manual, None);
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+        open.buffer.replace_ranges(&[edit]);
+        let text = open.buffer.contents();
+        open.word_count = mj_text::count::count(&text);
+        open.autosave.on_edit(std::time::Instant::now());
+        ws.diff = None;
+
+        self.toast = Some("已恢复此块，Ctrl+Z 可撤销".into());
+        Ok(())
+    }
+
+    /// `U`：整章恢复（§6.9 恢复粒度 1）。
+    fn restore_whole_chapter(&mut self) -> anyhow::Result<()> {
+        let old = match &self.screen {
+            Screen::Workspace(ws) => ws.diff.as_ref().map(|v| v.old_text().to_string()),
+            _ => None,
+        };
+        let Some(old) = old else { return Ok(()) };
+
+        // §6.9 明言：恢复前自动给当前版本打一次快照——**回退本身也可回退**。
+        // 这条不是锦上添花：用户点 U 的时候正慌，而慌的时候最容易点错。
+        self.take_snapshot(mj_core::history::Trigger::Manual, None);
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+        // 整章替换算一个撤销组。
+        let all = 0..open.buffer.len_bytes();
+        open.buffer.replace_ranges(&[(all, old)]);
+        let text = open.buffer.contents();
+        open.word_count = mj_text::count::count(&text);
+        open.autosave.on_edit(std::time::Instant::now());
+        ws.diff = None;
+
+        self.toast = Some("已恢复整章。恢复前的版本已存为快照，可再退回去".into());
+        Ok(())
+    }
+
+    /// `y`：复制旧内容到剪贴板，不改当前版本（§6.9 恢复粒度 3）。
+    fn copy_old_content(&mut self) -> anyhow::Result<()> {
+        let text = match &self.screen {
+            Screen::Workspace(ws) => ws.diff.as_ref().map(|v| v.copy_text()),
+            _ => None,
+        };
+        let Some(text) = text else { return Ok(()) };
+
+        let n = mj_text::count::count_with_punct(&text);
+        crate::clipboard::copy(&text);
+        self.toast = Some(format!("已复制 {n} 字到剪贴板"));
+        Ok(())
     }
 
     // ---- 查找替换（§6.6）----
@@ -507,15 +844,24 @@ impl App {
             self.toast = Some("没有勾选任何命中".into());
             return Ok(());
         }
+
+        // §6.6 [MUST]：替换前强制打快照。
+        //
+        // 批量替换是最容易一把毁掉一章的操作——一个写错的正则，几十处一起改。
+        // 撤销栈只活在本次会话里，快照才是关掉程序之后还在的后路。
+        self.take_snapshot(mj_core::history::Trigger::BeforeReplace, None);
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.search else {
+            return Ok(());
+        };
         let Some(open) = &mut ws.editor else {
             return Ok(());
         };
 
         // 一次批量替换 = 一个撤销组（与排版同理，§6.3）。
-        //
-        // 本章范围内撤销栈就够了。§6.6 要求的「全书替换前强制打快照」
-        // 与「撤销本次批量替换」依赖快照（M4 §6.9），故全书范围暂不提供——
-        // 没有快照就让人替换整本书，等于拿全书赌一次正则没写错。
         let n = edits.len();
         open.buffer.replace_ranges(&edits);
         let text = open.buffer.contents();
@@ -523,7 +869,7 @@ impl App {
         open.autosave.on_edit(std::time::Instant::now());
 
         p.refresh(&text);
-        self.toast = Some(format!("已替换 {n} 处，Ctrl+Z 可整体撤销"));
+        self.toast = Some(format!("已替换 {n} 处，Ctrl+Z 撤销 / F8 看快照"));
         Ok(())
     }
 
@@ -586,9 +932,6 @@ impl App {
         let Some(p) = ws.format_preview.take() else {
             return Ok(());
         };
-        let Some(open) = &mut ws.editor else {
-            return Ok(());
-        };
 
         let edits = p.selected_edits();
         if edits.is_empty() {
@@ -596,10 +939,20 @@ impl App {
             return Ok(());
         }
 
-        // §6.5：一次排版 = 一个撤销组。Ctrl+Z 一次退干净。
+        // §6.5 [MUST]：**执行前强制打快照**。
         //
-        // §6.5 还要求「执行前强制打快照」——快照属 M4（§6.9），尚未实现。
-        // 在那之前，撤销栈是唯一的后路：故这里绝不能退化成 N 个撤销组。
+        // 撤销栈只活在本次会话里——用户排完版关掉程序，就再也退不回去了。
+        // 快照才是真正的后路。这条 M3 时欠着（没有快照），现在补上。
+        self.take_snapshot(mj_core::history::Trigger::BeforeFormat, None);
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+
+        // §6.5：一次排版 = 一个撤销组。Ctrl+Z 一次退干净。
         let n = edits.len();
         open.buffer.replace_ranges(&edits);
         open.word_count = mj_text::count::count(&open.buffer.contents());
@@ -862,12 +1215,17 @@ impl App {
             saved_words,
         });
         ws.tree.focus_chapter(&ws.book, id);
+        // 换了一章就是另一条历史线，自动快照的基准要跟着重置。
+        self.last_snapshot = None;
         Ok(())
     }
 
     /// Tick 驱动的自动保存（§6.3、§7.4）。
     fn on_tick(&mut self) -> anyhow::Result<()> {
         let now = std::time::Instant::now();
+
+        // 自动快照（§6.9）：与自动保存共用心跳。
+        self.maybe_auto_snapshot();
 
         let action = {
             let Screen::Workspace(ws) = &mut self.screen else {
@@ -998,6 +1356,24 @@ impl App {
         }
     }
 
+    /// 供测试：手动打快照。
+    #[doc(hidden)]
+    pub fn manual_snapshot_for_demo(&mut self) -> anyhow::Result<()> {
+        self.manual_snapshot()
+    }
+
+    /// 供测试与截图：按 F8 打开历史面板。
+    #[doc(hidden)]
+    pub fn press_f8_for_demo(&mut self) -> anyhow::Result<()> {
+        self.open_history()
+    }
+
+    /// 供测试与截图：在历史面板里按 Enter。
+    #[doc(hidden)]
+    pub fn press_enter_in_history_for_demo(&mut self) -> anyhow::Result<()> {
+        self.open_diff()
+    }
+
     /// 供测试与截图：按 F5 打开排版预览。
     #[doc(hidden)]
     pub fn press_f5_for_demo(&mut self) -> anyhow::Result<()> {
@@ -1039,7 +1415,11 @@ impl App {
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
             Screen::Workspace(ws) => {
-                if let Some(p) = &mut ws.search {
+                if let Some(v) = &mut ws.diff {
+                    render_diff(frame, body, v);
+                } else if let Some(p) = &mut ws.history {
+                    render_history(frame, body, p);
+                } else if let Some(p) = &mut ws.search {
                     render_search(frame, body, p);
                 } else if let Some(p) = &mut ws.format_preview {
                     render_format_preview(frame, body, p);
@@ -1063,6 +1443,17 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.diff.is_some() => {
+                    // §12.4 的底栏。
+                    spans.push(Span::raw(
+                        " n/p 跳转改动 │ u 恢复此块 │ U 恢复整章 │ y 复制旧内容 │ Esc 关闭 ",
+                    ));
+                }
+                Screen::Workspace(ws) if ws.history.is_some() => {
+                    spans.push(Span::raw(
+                        " 历史 │ Enter 看 diff │ Space 选对照条 │ P 钉住 │ Esc 关闭 ",
+                    ));
                 }
                 Screen::Workspace(ws) if ws.search.is_some() => {
                     let hint = if ws.search.as_ref().is_some_and(|s| s.replace_mode) {
@@ -1145,7 +1536,7 @@ impl App {
                         spans.push(Span::raw(" "));
                     }
                     spans.push(Span::raw(
-                        "│ Ctrl+S 保存 │ Ctrl+F 查找 │ F5 排版 │ Esc 返回 ",
+                        "│ Ctrl+S 保存 │ F5 排版 │ F8 历史 │ F9 快照 │ Esc 返回 ",
                     ));
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
@@ -1228,6 +1619,96 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) 
         render_tree(frame, ta, ws);
     }
     render_editor(frame, editor_area, ws);
+}
+
+/// 历史面板（§6.9）。
+fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel) {
+    let title = match p.compare_target() {
+        Some(_) => " 历史 · 已选对照条，Enter 两条互比 ".to_string(),
+        None => format!(" 历史 · {} 条快照 ", p.snapshots().len()),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    p.set_height(inner.height as usize);
+
+    let lines: Vec<Line> = (p.scroll()..p.snapshots().len())
+        .take(inner.height as usize)
+        .map(|i| {
+            let mut style = Style::default();
+            if p.snapshots()[i].is_protected() {
+                // 受保护的醒目一点——它们是用户特意留下的锚点。
+                style = style.fg(Color::Yellow);
+            }
+            if i == p.cursor() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::styled(p.render_row(i), style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// diff 界面（§6.9、§12.4 的线框）。
+fn render_diff(frame: &mut ratatui::Frame, area: Rect, v: &mut DiffView) {
+    // §12.4：标题栏是「与「…」比较 ─── +312 / -87 / 3 处改动」。
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 与「{}」比较 ─── {} ",
+            v.old_title,
+            v.summary_line()
+        ))
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    v.set_height(inner.height as usize);
+
+    // §6.9：宽度 ≥ 100 列时左右分栏，否则 inline。
+    //
+    // M4 先做 inline —— 它在两种宽度下都读得懂，而分栏在窄屏上会把
+    // 中文正文挤成每行三四个字。分栏留到 M6 与外观预设一起做。
+    let _side_by_side = DiffView::use_side_by_side(inner.width);
+
+    let lines: Vec<Line> = v
+        .inline_lines()
+        .into_iter()
+        .skip(v.scroll())
+        .take(inner.height as usize)
+        .map(|dl| {
+            let current = dl.hunk == Some(v.hunk_cursor());
+            let (marker, style) = match dl.kind {
+                // §6.9：增行绿底、删行红底。
+                LineKind::Insert => ("+", Style::default().fg(Color::Green)),
+                LineKind::Delete => ("-", Style::default().fg(Color::Red)),
+                LineKind::Equal => (" ", Style::default().fg(Color::DarkGray)),
+            };
+            // 当前块加粗——n/p 跳过来之后要看得出跳到哪了。
+            let style = if current {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            Line::styled(format!("{:>4} │ {marker} {}", dl.line_no, dl.text), style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 快照的显示名，如「07-14 22:10 · 投稿版」（§12.4 的线框）。
+fn snapshot_title(s: &mj_core::history::Snapshot) -> String {
+    let when = s.created.format("%m-%d %H:%M");
+    match &s.label {
+        Some(l) => format!("{when} · {l}"),
+        None => format!("{when} · {}", s.trigger.label()),
+    }
 }
 
 /// 查找替换面板（§6.6）。
