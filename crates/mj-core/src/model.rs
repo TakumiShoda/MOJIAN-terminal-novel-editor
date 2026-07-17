@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 
-use crate::id::{BookId, ChapterId, VolumeId};
+use crate::id::{BookId, ChapterId, CharacterId, VolumeId};
 
 /// 稀疏排序的步长。见 doc.md §5.3。
 ///
@@ -183,6 +183,66 @@ pub fn order_between(prev: Option<u32>, next: Option<u32>) -> Option<u32> {
 pub fn renumber(orders: &mut [u32]) {
     for (i, o) in orders.iter_mut().enumerate() {
         *o = (i as u32 + 1) * ORDER_STEP;
+    }
+}
+
+/// 角色间的一条关系（§6.7）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Relation {
+    pub target: CharacterId,
+    pub label: String,
+}
+
+/// 角色卡（§6.7）。`characters/<id>.toml`。
+///
+/// `name` + `aliases` 有两处硬用途：注入 jieba 用户词典（校对不误报的前提），
+/// 以及喂专名一致性检查。其余字段是给作者看的设定，程序不解读。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Character {
+    pub id: CharacterId,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub role: String,
+    pub gender: String,
+    pub age: String,
+    pub background: String,
+    pub personality: String,
+    pub appearance: String,
+    pub habits: String,
+    pub speech: String,
+    pub relations: Vec<Relation>,
+    pub first_appearance: Option<ChapterId>,
+    pub notes: String,
+    /// 用户自定义字段（`[custom]`），回写保留。
+    pub custom: toml::Table,
+}
+
+impl Character {
+    pub fn new(id: CharacterId, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            aliases: Vec::new(),
+            role: String::new(),
+            gender: String::new(),
+            age: String::new(),
+            background: String::new(),
+            personality: String::new(),
+            appearance: String::new(),
+            habits: String::new(),
+            speech: String::new(),
+            relations: Vec::new(),
+            first_appearance: None,
+            notes: String::new(),
+            custom: toml::Table::new(),
+        }
+    }
+
+    /// 校对用的全部称谓：名 + 别名，去空。
+    pub fn all_names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.name.as_str())
+            .chain(self.aliases.iter().map(|s| s.as_str()))
+            .filter(|s| !s.trim().is_empty())
     }
 }
 

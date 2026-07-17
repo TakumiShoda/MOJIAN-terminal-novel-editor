@@ -28,6 +28,9 @@ pub struct Config {
     pub history: History,
     #[serde(default)]
     pub appearance: Appearance,
+    /// 校对规则开关与阈值（§6.8、§8 `[proof]`）。
+    #[serde(default)]
+    pub proof: Proof,
 
     /// 未知的顶层表，原样透传（doc.md §8 前向兼容）。
     #[serde(flatten)]
@@ -110,6 +113,77 @@ impl Default for History {
             auto_interval_min: 10,
             auto_min_words: 300,
             extra: toml::Table::new(),
+        }
+    }
+}
+
+/// 校对配置（§6.8）。默认对应「本地规则默认开、文风前两条开、的地得折叠」。
+///
+/// 落到 mj-text 的 `ProofOptions`/`StyleParams` 由 `to_options` 完成——
+/// 配置里写的与校对真正用的是同一套值，不再包一层就走不偏。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Proof {
+    pub confusion: bool,
+    pub punct: bool,
+    pub consistency: bool,
+    pub de_di_de: bool,
+    pub comma_chain: bool,
+    pub comma_chain_max: usize,
+    pub long_sentence: bool,
+    pub long_sentence_max: usize,
+    pub word_repeat: bool,
+    pub short_burst: bool,
+    /// 低于此置信度的问题 UI 默认折叠（§12.3：的地得 <0.6 折叠）。
+    pub fold_below: f32,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl Default for Proof {
+    fn default() -> Self {
+        Self {
+            confusion: true,
+            punct: true,
+            consistency: true,
+            de_di_de: true,
+            comma_chain: true,
+            comma_chain_max: 6,
+            long_sentence: true,
+            long_sentence_max: 60,
+            word_repeat: false,
+            short_burst: false,
+            fold_below: 0.6,
+            extra: toml::Table::new(),
+        }
+    }
+}
+
+impl Proof {
+    /// 映射到 mj-text 的规则选项。
+    pub fn to_options(&self) -> mj_text::proof::ProofOptions {
+        let mut style = mj_text::proof::style::StyleParams {
+            comma_chain_on: self.comma_chain,
+            comma_chain_max: self.comma_chain_max,
+            long_sentence_on: self.long_sentence,
+            long_sentence_max: self.long_sentence_max,
+            word_repeat_on: self.word_repeat,
+            short_burst_on: self.short_burst,
+            ..mj_text::proof::style::StyleParams::default()
+        };
+        // 阈值为 0 会把「> 0」变成对所有句子都报，几乎必是配置笔误；退回默认。
+        if style.comma_chain_max == 0 {
+            style.comma_chain_max = 6;
+        }
+        if style.long_sentence_max == 0 {
+            style.long_sentence_max = 60;
+        }
+        mj_text::proof::ProofOptions {
+            confusion_on: self.confusion,
+            punct_on: self.punct,
+            consistency_on: self.consistency,
+            de_di_de_on: self.de_di_de,
+            style,
         }
     }
 }

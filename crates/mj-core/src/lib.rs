@@ -10,6 +10,7 @@ pub mod id;
 pub mod index;
 pub mod lock;
 pub mod model;
+pub mod proofing;
 pub mod slug;
 pub mod store;
 pub mod swap;

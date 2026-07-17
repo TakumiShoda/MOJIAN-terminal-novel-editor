@@ -49,6 +49,21 @@ impl Workspace {
         self.root.join("dict")
     }
 
+    /// 用户词典（专名，注入 jieba）。§5.1。
+    pub fn user_dict_file(&self) -> PathBuf {
+        self.dict_dir().join("user.txt")
+    }
+
+    /// 用户混淆集（覆盖/追加内置）。§5.1。
+    pub fn confusion_file(&self) -> PathBuf {
+        self.dict_dir().join("confusion.tsv")
+    }
+
+    /// 已忽略的校对问题（按 hash）。§5.1、§6.8。
+    pub fn ignore_file(&self) -> PathBuf {
+        self.dict_dir().join("ignore.json")
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }

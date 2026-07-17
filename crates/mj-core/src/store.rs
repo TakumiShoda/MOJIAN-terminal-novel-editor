@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use crate::chapter_file::{ChapterFile, FrontMatter};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::id::{BookId, ChapterId, VolumeId};
-use crate::model::{Book, ChapterBody, ChapterMeta, Volume, order_between, renumber};
+use crate::id::{BookId, ChapterId, CharacterId, VolumeId};
+use crate::model::{
+    Book, ChapterBody, ChapterMeta, Character, Relation, Volume, order_between, renumber,
+};
 use crate::slug::slugify;
 use crate::workspace::Workspace;
 
@@ -67,6 +69,103 @@ struct VolumeToml {
     synopsis: String,
     #[serde(flatten)]
     extra: toml::Table,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RelationToml {
+    target: CharacterId,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CharacterToml {
+    id: CharacterId,
+    #[serde(default)]
+    name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    role: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    gender: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    age: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    background: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    personality: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    appearance: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    habits: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    speech: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    relations: Vec<RelationToml>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_appearance: Option<ChapterId>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    notes: String,
+    // §6.7 的 `[custom]`：用户自定义字段。放最后，TOML 里会渲染成一个表段。
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    custom: toml::Table,
+}
+
+impl CharacterToml {
+    fn into_model(self) -> Character {
+        Character {
+            id: self.id,
+            name: self.name,
+            aliases: self.aliases,
+            role: self.role,
+            gender: self.gender,
+            age: self.age,
+            background: self.background,
+            personality: self.personality,
+            appearance: self.appearance,
+            habits: self.habits,
+            speech: self.speech,
+            relations: self
+                .relations
+                .into_iter()
+                .map(|r| Relation {
+                    target: r.target,
+                    label: r.label,
+                })
+                .collect(),
+            first_appearance: self.first_appearance,
+            notes: self.notes,
+            custom: self.custom,
+        }
+    }
+
+    fn from_model(c: &Character) -> Self {
+        Self {
+            id: c.id,
+            name: c.name.clone(),
+            aliases: c.aliases.clone(),
+            role: c.role.clone(),
+            gender: c.gender.clone(),
+            age: c.age.clone(),
+            background: c.background.clone(),
+            personality: c.personality.clone(),
+            appearance: c.appearance.clone(),
+            habits: c.habits.clone(),
+            speech: c.speech.clone(),
+            relations: c
+                .relations
+                .iter()
+                .map(|r| RelationToml {
+                    target: r.target,
+                    label: r.label.clone(),
+                })
+                .collect(),
+            first_appearance: c.first_appearance,
+            notes: c.notes.clone(),
+            custom: c.custom.clone(),
+        }
+    }
 }
 
 impl Store {
@@ -310,6 +409,92 @@ impl Store {
         let path = self.chapter_path(book, vol, order, title)?;
         self.write_chapter_file(&path, &file)?;
         Ok(id)
+    }
+
+    // ---- 角色卡（§6.7）----
+
+    fn characters_dir(&self, book: BookId) -> PathBuf {
+        self.book_dir(book).join("characters")
+    }
+
+    fn character_path(&self, book: BookId, id: CharacterId) -> PathBuf {
+        self.characters_dir(book).join(format!("{id}.toml"))
+    }
+
+    /// 新建角色（只给名字，其余留空待编辑）。
+    pub fn create_character(&mut self, book: BookId, name: &str) -> Result<Character> {
+        let c = Character::new(CharacterId::generate(), name);
+        self.save_character(book, &c)?;
+        Ok(c)
+    }
+
+    /// 落盘一张角色卡（原子写）。
+    pub fn save_character(&self, book: BookId, c: &Character) -> Result<()> {
+        let dir = self.characters_dir(book);
+        std::fs::create_dir_all(&dir).map_err(|source| Error::Io {
+            path: dir.clone(),
+            source,
+        })?;
+        let ct = CharacterToml::from_model(c);
+        let text = toml::to_string(&ct).map_err(|e| Error::ChapterParse {
+            path: self.character_path(book, c.id),
+            message: e.to_string(),
+        })?;
+        crate::atomic::write(&self.character_path(book, c.id), text.as_bytes())
+    }
+
+    pub fn load_character(&self, book: BookId, id: CharacterId) -> Result<Character> {
+        let path = self.character_path(book, id);
+        let text = read_to_string(&path)?;
+        let ct: CharacterToml = toml::from_str(&text).map_err(|source| Error::ConfigParse {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+        Ok(ct.into_model())
+    }
+
+    /// 列出一本书的全部角色，按名字排序（§6.7 列表页）。
+    ///
+    /// 单张卡解析失败只跳过并记日志，不连累其余——一张坏卡不该让整个角色页打不开。
+    pub fn list_characters(&self, book: BookId) -> Result<Vec<Character>> {
+        let dir = self.characters_dir(book);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(Error::Io { path: dir, source }),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            match read_to_string(&path).and_then(|t| {
+                toml::from_str::<CharacterToml>(&t).map_err(|source| Error::ConfigParse {
+                    path: path.clone(),
+                    source: Box::new(source),
+                })
+            }) {
+                Ok(ct) => out.push(ct.into_model()),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "跳过无法解析的角色卡")
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// 删除角色：移到书内 `trash/characters/`，不真删（§0：破坏性操作可撤销）。
+    pub fn delete_character(&self, book: BookId, id: CharacterId) -> Result<()> {
+        let src = self.character_path(book, id);
+        let trash = self.book_dir(book).join("trash").join("characters");
+        std::fs::create_dir_all(&trash).map_err(|source| Error::Io {
+            path: trash.clone(),
+            source,
+        })?;
+        let dst = trash.join(format!("{id}.toml"));
+        std::fs::rename(&src, &dst).map_err(|source| Error::Io { path: src, source })
     }
 
     // ---- 正文读写（§6.2 契约）----

@@ -26,6 +26,7 @@ pub mod punct;
 pub mod rules;
 pub mod style;
 
+pub use confusion::ConfusionSet;
 pub use rules::{ProofOptions, RuleProofreader};
 
 /// 严重度。UI 按此分组、着色（Error 红 / Warning 黄 / Hint 暗）。
