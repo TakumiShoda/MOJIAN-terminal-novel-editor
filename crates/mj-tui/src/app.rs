@@ -23,6 +23,7 @@ use crate::event::{AppEvent, EventLoop};
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
+use crate::screens::proof_panel::{self, ProofPanel};
 use crate::screens::search_panel::{self, SearchPanel};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
@@ -69,6 +70,8 @@ struct Workspace {
     batch: Option<BatchJob>,
     /// 宽范围作业的确认框。同上，M6 并入浮层栈。
     confirm: Option<Confirm>,
+    /// 校对面板（F7，§6.8）。同上，M6 并入浮层栈。
+    proof: Option<ProofPanel>,
 }
 
 impl Workspace {
@@ -123,6 +126,8 @@ pub struct App {
     last_snapshot: Option<(std::time::Instant, usize)>,
     /// 上一次批量操作的回滚记录（§6.6 [MUST]「撤销本次批量替换」）。
     batch_undo: Option<BatchUndo>,
+    /// 已忽略的校对问题（§6.8）。懒加载：首次 F7 时从 dict/ignore.json 读。
+    ignore: Option<mj_core::proofing::IgnoreSet>,
 }
 
 impl App {
@@ -141,6 +146,7 @@ impl App {
             today_words: 0,
             last_snapshot: None,
             batch_undo: None,
+            ignore: None,
         })
     }
 
@@ -336,6 +342,7 @@ impl App {
             diff: None,
             batch: None,
             confirm: None,
+            proof: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -369,6 +376,9 @@ impl App {
         if matches!(&self.screen, Screen::Workspace(ws) if ws.format_preview.is_some()) {
             return self.on_key_format_preview(code);
         }
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.proof.is_some()) {
+            return self.on_key_proof(code);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.stats.is_some()) {
             return self.on_key_stats(code);
         }
@@ -377,6 +387,8 @@ impl App {
         match code {
             // F5 一键排版（当前章，弹预览）——§7.3 键位表。
             KeyCode::F(5) => return self.open_format_preview(),
+            // F7 校对当前章（§6.8、§7.3）。
+            KeyCode::F(7) => return self.open_proof(),
             // F8 历史面板（§7.3）。
             KeyCode::F(8) => return self.open_history(),
 
@@ -1236,6 +1248,191 @@ impl App {
         Ok(())
     }
 
+    // ---- 校对（§6.8）----
+
+    /// 忽略表，懒加载并缓存。
+    fn ignore_set(&mut self) -> &mut mj_core::proofing::IgnoreSet {
+        let path = self.store.workspace().ignore_file();
+        self.ignore
+            .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path))
+    }
+
+    /// F7：校对当前章。
+    ///
+    /// 手动触发，就地同步跑——本地规则对单章是亚毫秒级，远在 §9 的 16ms 预算内，
+    /// 且这不是打字过程（§6.8 [MUST] 说的「绝不在打字时同步跑」指的是自动模式）。
+    fn open_proof(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &ws.editor else {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        };
+        let book = ws.book.id;
+        let text = open.buffer.contents();
+
+        // 专名上下文（角色名 + 用户词典）——校对不误报的前提（§6.7）。
+        let ctx = mj_core::proofing::build_context(&self.store, self.store.workspace(), book)
+            .unwrap_or_default();
+        let proofer =
+            mj_core::proofing::Proofer::from_workspace(self.store.workspace(), &self.config);
+        let ignore = {
+            let path = self.store.workspace().ignore_file();
+            self.ignore
+                .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path))
+        };
+        let issues = proofer
+            .check_chapter(&text, &ctx, ignore, &mj_text::proof::CancelToken::new())
+            .unwrap_or_default();
+
+        let fold = self.config.proof.fold_below;
+        let n = issues.len();
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.proof = Some(ProofPanel::new(issues, fold));
+        }
+        self.toast = Some(if n == 0 {
+            "校对完成：未发现问题".into()
+        } else {
+            format!("校对完成：{n} 处待看")
+        });
+        Ok(())
+    }
+
+    fn on_key_proof(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // 会改正文/写盘的动作先脱离对 ws 的借用。
+        match code {
+            KeyCode::Char('a') => return self.apply_proof_suggestion(),
+            KeyCode::Char('I') => return self.ignore_proof_permanent(),
+            _ => {}
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.proof else {
+            return Ok(());
+        };
+        match code {
+            KeyCode::Esc | KeyCode::F(7) | KeyCode::Char('q') => ws.proof = None,
+            KeyCode::Down | KeyCode::Char('j') => p.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => p.move_up(),
+            KeyCode::Char('f') => p.toggle_folded(),
+            // i：本次忽略（只从列表摘掉，不落盘）。
+            KeyCode::Char('i') => {
+                if p.remove_current().is_some() {
+                    self.toast = Some("已忽略（本次）".into());
+                }
+            }
+            // Enter：跳到问题处，关面板。
+            KeyCode::Enter => {
+                let target = p.current().map(|i| i.range.start);
+                if let Some(pos) = target {
+                    ws.proof = None;
+                    if let Some(open) = &mut ws.editor {
+                        open.buffer.move_to(pos);
+                        open.viewport.scroll_to_cursor(&open.buffer);
+                        ws.focus = Focus::Editor;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `a`：把当前问题的首个建议应用到正文。
+    fn apply_proof_suggestion(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &ws.proof else {
+            return Ok(());
+        };
+        let Some(issue) = p.current() else {
+            return Ok(());
+        };
+        let Some(suggestion) = issue.suggestions.first().cloned() else {
+            self.toast = Some("这条问题没有可一键应用的建议".into());
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+
+        open.buffer
+            .replace_ranges(&[(issue.range.clone(), suggestion)]);
+        let text = open.buffer.contents();
+        open.word_count = mj_text::count::count(&text);
+        open.autosave.on_edit(std::time::Instant::now());
+
+        // 正文变了，所有 range 失效——重新校对，拿一份新的列表。
+        self.reproof_current();
+        self.toast = Some("已应用建议".into());
+        Ok(())
+    }
+
+    /// `I`：永久忽略当前问题——算忽略键、写入 dict/ignore.json。
+    fn ignore_proof_permanent(&mut self) -> anyhow::Result<()> {
+        // 先取出问题与整章文本（算键要用整章文本）。
+        let (issue, text) = {
+            let Screen::Workspace(ws) = &self.screen else {
+                return Ok(());
+            };
+            let (Some(p), Some(open)) = (&ws.proof, &ws.editor) else {
+                return Ok(());
+            };
+            match p.current() {
+                Some(i) => (i, open.buffer.contents()),
+                None => return Ok(()),
+            }
+        };
+
+        let key = mj_core::proofing::ignore_key(&text, &issue);
+        let path = self.store.workspace().ignore_file();
+        let set = self.ignore_set();
+        set.insert(key);
+        if let Err(e) = set.save(&path) {
+            self.toast = Some(format!("忽略已记下，但写盘失败：{e}"));
+        } else {
+            self.toast = Some("已永久忽略".into());
+        }
+
+        // 从当前列表摘掉。
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(p) = &mut ws.proof
+        {
+            p.remove_current();
+        }
+        Ok(())
+    }
+
+    /// 重新校对当前章，替换面板里的问题列表（应用建议后调用）。
+    fn reproof_current(&mut self) {
+        let Screen::Workspace(ws) = &self.screen else {
+            return;
+        };
+        let (Some(open), book) = (&ws.editor, ws.book.id) else {
+            return;
+        };
+        let text = open.buffer.contents();
+        let ctx = mj_core::proofing::build_context(&self.store, self.store.workspace(), book)
+            .unwrap_or_default();
+        let proofer =
+            mj_core::proofing::Proofer::from_workspace(self.store.workspace(), &self.config);
+        let path = self.store.workspace().ignore_file();
+        let ignore = self
+            .ignore
+            .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path));
+        let issues = proofer
+            .check_chapter(&text, &ctx, ignore, &mj_text::proof::CancelToken::new())
+            .unwrap_or_default();
+        let fold = self.config.proof.fold_below;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.proof = Some(ProofPanel::new(issues, fold));
+        }
+    }
+
     // ---- 排版（§6.5）----
 
     /// F5：对当前章生成排版计划并弹出预览。
@@ -1749,6 +1946,24 @@ impl App {
         matches!(&self.screen, Screen::Workspace(ws) if ws.confirm.is_some())
     }
 
+    /// 供测试：校对面板可见问题数（None = 面板没开）。
+    #[doc(hidden)]
+    pub fn proof_visible_for_test(&self) -> Option<usize> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.proof.as_ref().map(|p| p.visible_count()),
+            _ => None,
+        }
+    }
+
+    /// 供测试：当前编辑缓冲的正文。
+    #[doc(hidden)]
+    pub fn buffer_text_for_test(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.buffer.contents()),
+            _ => None,
+        }
+    }
+
     /// 供测试：把编辑焦点切到指定章（决定「当前章/当前卷」范围）。
     #[doc(hidden)]
     pub fn open_chapter_for_test(&mut self, ch: ChapterId) -> anyhow::Result<()> {
@@ -1884,6 +2099,8 @@ impl App {
                     render_search(frame, body, p);
                 } else if let Some(p) = &mut ws.format_preview {
                     render_format_preview(frame, body, p);
+                } else if let Some(p) = &mut ws.proof {
+                    render_proof(frame, body, p);
                 } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
                     render_stats(frame, body, st, &rows, &ws.book.title);
                 } else {
@@ -1912,6 +2129,20 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.proof.is_some() => {
+                    spans.push(Span::raw(
+                        " 校对 │ j/k 移动 │ Enter 跳转 │ a 应用建议 │ i 忽略 │ I 永久忽略 ",
+                    ));
+                    if let Some((n, shown)) = ws.proof.as_ref().and_then(|p| p.fold_hint()) {
+                        let label = if shown {
+                            format!("│ f 收起 {n} 条低置信 ")
+                        } else {
+                            format!("│ f 展开 {n} 条低置信 ")
+                        };
+                        spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                    }
+                    spans.push(Span::raw("│ Esc 关闭 "));
                 }
                 Screen::Workspace(ws) if ws.confirm.is_some() => {
                     spans.push(Span::raw(" ←/→ 选择 │ Enter 确定 │ y 执行 │ Esc 取消 "));
@@ -2305,6 +2536,93 @@ fn field_line(label: &str, value: &str, focused: bool) -> Vec<Span<'static>> {
 }
 
 /// 排版预览（§6.5 [MUST]：显示将改动的位置与条数，可逐条取消）。
+/// 校对面板（F7，§6.8）。按严重度分组，逐条列出，命中原文加下划线着色。
+fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
+    use mj_text::proof::Severity;
+    use proof_panel::Row;
+
+    let title = if p.is_empty() {
+        " 校对 · 未发现问题 ".to_string()
+    } else {
+        format!(" 校对 · {} 处 ", p.visible_count())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if p.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from("这一章没有发现问题。").centered(),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    p.set_height(inner.height as usize);
+
+    // 每条问题占一行；分组表头也占一行，但不参与滚动窗口（近似：表头很少，
+    // 直接连问题一起画，靠 scroll 起点对齐问题序号）。
+    let rows = p.rows();
+    let sev_color = |s: Severity| match s {
+        Severity::Error => Color::Red,
+        Severity::Warning => Color::Yellow,
+        Severity::Hint => Color::DarkGray,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for row in &rows {
+        match row {
+            Row::Header(sev, count) => {
+                lines.push(Line::from(Span::styled(
+                    format!("── {} ({count}) ──", sev.label()),
+                    Style::default()
+                        .fg(sev_color(*sev))
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            Row::Issue {
+                index,
+                issue,
+                selected,
+            } => {
+                let mut base = Style::default().fg(sev_color(issue.severity));
+                if *selected {
+                    base = base.add_modifier(Modifier::REVERSED);
+                }
+                let cat = issue.category.label();
+                let sug = issue
+                    .suggestions
+                    .first()
+                    .map(|s| format!(" → {s}"))
+                    .unwrap_or_default();
+                // 序号仅用于让选中项在滚动窗内可辨，不显示。
+                let _ = index;
+                lines.push(Line::from(vec![
+                    Span::styled(format!("[{cat}] "), base),
+                    Span::styled(issue.message.clone(), base),
+                    Span::styled(sug, Style::default().fg(Color::Green)),
+                ]));
+            }
+        }
+    }
+
+    // 简单滚动：按选中问题所在的行，把窗口对齐（表头也算行）。
+    let selected_line = rows
+        .iter()
+        .position(|r| matches!(r, Row::Issue { selected: true, .. }))
+        .unwrap_or(0);
+    let h = inner.height as usize;
+    let start = selected_line.saturating_sub(h.saturating_sub(1));
+    let view: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
+    frame.render_widget(Paragraph::new(view), inner);
+}
+
 fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatPreview) {
     let block = Block::default()
         .borders(Borders::ALL)

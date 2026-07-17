@@ -83,7 +83,9 @@ pub fn check(para: &str, ctx: &ProofContext) -> Vec<Issue> {
                 message: format!("「{cand}」与角色名「{name_str}」仅一字之差，是否笔误？"),
                 suggestions: vec![name_str],
                 source: Source::Rule,
-                confidence: 0.55,
+                // 高于默认折叠线（0.6）：这是长篇最实用的检查之一，该默认可见；
+                // 但仍留有误报余地（林中/林风），故不给到混淆集那样的 0.9。
+                confidence: 0.65,
             });
         }
     }
