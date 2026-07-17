@@ -507,15 +507,30 @@ mod tests {
         assert!(id.as_str().chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// 断言按**路径分量**来，不能拿字符串比 `"objects/"`——
+    /// Windows 上 `PathBuf::join` 给的是 `objects\..`，反斜杠。
+    /// （这条正是 CI 在 windows-latest 上打出来的：路径本身两个平台都对，
+    /// 是我的断言写死了 Unix 分隔符。）
     #[test]
     fn blob_path_is_bucketed() {
         let id = SnapshotId::of("雪");
         let rel = id.blob_rel();
-        let s = rel.to_string_lossy();
-        assert!(s.starts_with("objects/"), "{s}");
-        assert!(s.ends_with(".zst"), "{s}");
-        // 前两位分桶
-        assert_eq!(rel.components().count(), 3, "objects/<桶>/<文件>");
+
+        assert!(rel.starts_with("objects"), "{rel:?}");
+        assert_eq!(
+            rel.extension().and_then(|e| e.to_str()),
+            Some("zst"),
+            "{rel:?}"
+        );
+        assert_eq!(rel.components().count(), 3, "objects/<桶>/<文件>: {rel:?}");
+
+        // 桶名 = id 的前两位。
+        let bucket = rel
+            .components()
+            .nth(1)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned());
+        let want: String = id.as_str().chars().take(2).collect();
+        assert_eq!(bucket.as_deref(), Some(want.as_str()), "{rel:?}");
     }
 
     // ---- 快照与去重 ----
