@@ -72,6 +72,9 @@ struct Workspace {
     confirm: Option<Confirm>,
     /// 校对面板（F7，§6.8）。同上，M6 并入浮层栈。
     proof: Option<ProofPanel>,
+    /// 最近一次校对的问题（整章坐标），供正文下划线着色（§6.8 [MUST]）。
+    /// 关面板后仍留着，好让 Enter 跳过去时看得见；正文一改就清空——坐标失效了。
+    proof_issues: Vec<mj_text::proof::Issue>,
 }
 
 impl Workspace {
@@ -343,6 +346,7 @@ impl App {
             batch: None,
             confirm: None,
             proof: None,
+            proof_issues: Vec::new(),
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -1289,6 +1293,7 @@ impl App {
         let fold = self.config.proof.fold_below;
         let n = issues.len();
         if let Screen::Workspace(ws) = &mut self.screen {
+            ws.proof_issues = issues.clone();
             ws.proof = Some(ProofPanel::new(issues, fold));
         }
         self.toast = Some(if n == 0 {
@@ -1320,7 +1325,9 @@ impl App {
             KeyCode::Char('f') => p.toggle_folded(),
             // i：本次忽略（只从列表摘掉，不落盘）。
             KeyCode::Char('i') => {
-                if p.remove_current().is_some() {
+                if let Some(removed) = p.remove_current() {
+                    ws.proof_issues
+                        .retain(|i| !(i.range == removed.range && i.rule_id == removed.rule_id));
                     self.toast = Some("已忽略（本次）".into());
                 }
             }
@@ -1398,11 +1405,13 @@ impl App {
             self.toast = Some("已永久忽略".into());
         }
 
-        // 从当前列表摘掉。
+        // 从当前列表与下划线集里摘掉。
         if let Screen::Workspace(ws) = &mut self.screen
             && let Some(p) = &mut ws.proof
+            && let Some(removed) = p.remove_current()
         {
-            p.remove_current();
+            ws.proof_issues
+                .retain(|i| !(i.range == removed.range && i.rule_id == removed.rule_id));
         }
         Ok(())
     }
@@ -1429,6 +1438,7 @@ impl App {
             .unwrap_or_default();
         let fold = self.config.proof.fold_below;
         if let Screen::Workspace(ws) = &mut self.screen {
+            ws.proof_issues = issues.clone();
             ws.proof = Some(ProofPanel::new(issues, fold));
         }
     }
@@ -1731,6 +1741,8 @@ impl App {
             // 字数只在编辑后重算，不在每帧渲染时算——后者会让 10 万字章节
             // 的每次按键都做一遍全量统计，直接吃掉 §9 的 16ms 预算。
             open.word_count = mj_text::count::count(&open.buffer.contents());
+            // 正文一改，校对命中的坐标就失效——清掉下划线，别让它标在错的字上。
+            ws.proof_issues.clear();
         }
         open.viewport.scroll_to_cursor(&open.buffer);
         Ok(())
@@ -1790,6 +1802,8 @@ impl App {
             saved_words,
         });
         ws.tree.focus_chapter(&ws.book, id);
+        // 换章：上一章的校对命中作废，清掉下划线。
+        ws.proof_issues.clear();
         // 换了一章就是另一条历史线，自动快照的基准要跟着重置。
         self.last_snapshot = None;
         Ok(())
@@ -2538,7 +2552,6 @@ fn field_line(label: &str, value: &str, focused: bool) -> Vec<Span<'static>> {
 /// 排版预览（§6.5 [MUST]：显示将改动的位置与条数，可逐条取消）。
 /// 校对面板（F7，§6.8）。按严重度分组，逐条列出，命中原文加下划线着色。
 fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
-    use mj_text::proof::Severity;
     use proof_panel::Row;
 
     let title = if p.is_empty() {
@@ -2569,11 +2582,7 @@ fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
     // 每条问题占一行；分组表头也占一行，但不参与滚动窗口（近似：表头很少，
     // 直接连问题一起画，靠 scroll 起点对齐问题序号）。
     let rows = p.rows();
-    let sev_color = |s: Severity| match s {
-        Severity::Error => Color::Red,
-        Severity::Warning => Color::Yellow,
-        Severity::Hint => Color::DarkGray,
-    };
+    let sev_color = proof_severity_color;
 
     let mut lines: Vec<Line> = Vec::new();
     for row in &rows {
@@ -2857,6 +2866,9 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // 校对命中集（不同字段，与下面对 editor 的可变借用不冲突）。
+    let issues = &ws.proof_issues;
+
     let Some(open) = &mut ws.editor else {
         frame.render_widget(
             Paragraph::new(vec![Line::from(""), Line::from("选一章开始写").centered()]),
@@ -2877,7 +2889,23 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
         .map(|dl| {
             let text = crate::editor::view::line_slice(&open.buffer, dl.range.clone());
             // 续行缩进，与段首正文左边缘对齐——否则折行看起来像新段落。
-            Line::raw(format!("{}{}", " ".repeat(dl.indent), text))
+            let mut spans: Vec<Span> = Vec::new();
+            if dl.indent > 0 {
+                spans.push(Span::raw(" ".repeat(dl.indent)));
+            }
+            // 按校对命中把本行切段，命中处加下划线着色（§6.8 [MUST]）。
+            for seg in proof_panel::line_segments(&text, dl.range.start, issues) {
+                match seg.hit {
+                    None => spans.push(Span::raw(seg.text)),
+                    Some(sev) => spans.push(Span::styled(
+                        seg.text,
+                        Style::default()
+                            .fg(proof_severity_color(sev))
+                            .add_modifier(Modifier::UNDERLINED),
+                    )),
+                }
+            }
+            Line::from(spans)
         })
         .collect();
 
@@ -2886,6 +2914,16 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     // 光标只在编辑器有焦点时显示。
     if focused && let Some((col, row)) = open.viewport.cursor_screen_pos(&open.buffer) {
         frame.set_cursor_position((inner.x + col, inner.y + row));
+    }
+}
+
+/// 校对严重度配色（§6.8：Error 红 / Warning 黄 / Hint 暗）。正文下划线与面板共用。
+fn proof_severity_color(sev: mj_text::proof::Severity) -> Color {
+    use mj_text::proof::Severity;
+    match sev {
+        Severity::Error => Color::Red,
+        Severity::Warning => Color::Yellow,
+        Severity::Hint => Color::DarkGray,
     }
 }
 

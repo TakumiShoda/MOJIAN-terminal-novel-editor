@@ -9,6 +9,8 @@ use mj_core::id::{BookId, ChapterId};
 use mj_core::store::Store;
 use mj_core::workspace::Workspace;
 use mj_tui::app::App;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
 const NONE: KeyModifiers = KeyModifiers::NONE;
@@ -151,6 +153,31 @@ fn character_name_drives_consistency_check() {
         Some(1),
         "应根据角色名报出「沈研」可疑"
     );
+}
+
+fn draw_ok(app: &mut App, w: u16, h: u16) -> bool {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render_for_test(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .map(|(x, y)| buf[(x, y)].symbol().to_string())
+        .collect();
+    !text.contains('\u{fffd}')
+}
+
+/// 面板渲染 + 关面板后正文下划线：各档宽度都不撕屏（§6.8 [MUST] 命中着色、§10）。
+#[test]
+fn proof_panel_and_underlines_render_across_widths() {
+    let f = setup("现场气氛如火如茶，他跑的很快。\n");
+    for (w, h) in [(60, 20), (80, 24), (120, 30), (200, 50)] {
+        let mut app = f.app();
+        app.press_for_test(KeyCode::F(7), NONE).unwrap();
+        assert!(draw_ok(&mut app, w, h), "校对面板在 {w}x{h} 撕屏了");
+        // Enter 关面板、留下划线，正文再画一遍。
+        app.press_for_test(KeyCode::Enter, NONE).unwrap();
+        assert!(draw_ok(&mut app, w, h), "正文下划线在 {w}x{h} 撕屏了");
+    }
 }
 
 /// Esc 关闭面板。

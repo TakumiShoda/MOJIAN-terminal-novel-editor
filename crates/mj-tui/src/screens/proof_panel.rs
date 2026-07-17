@@ -9,6 +9,72 @@
 
 use mj_text::proof::{Issue, Severity};
 
+/// 正文一行按校对命中切成的一段：普通文字，或某严重度的命中（要着色/加下划线）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    pub text: String,
+    /// `Some` = 命中，按此严重度着色并加下划线；`None` = 普通文字。
+    pub hit: Option<Severity>,
+}
+
+/// 把正文一行按命中区间切段，供编辑器着色（§6.8：命中处加下划线/波浪线）。
+///
+/// `line_start` 是本行首字节在整章正文里的偏移；`issues` 是整章坐标的问题。
+/// 只切与本行相交的部分。命中互相重叠时取更严重者，避免同一段套两种色。
+pub fn line_segments(line_text: &str, line_start: usize, issues: &[Issue]) -> Vec<Segment> {
+    let line_end = line_start + line_text.len();
+    // 收集与本行相交的 (行内起, 行内止, 严重度)。
+    let mut spans: Vec<(usize, usize, Severity)> = Vec::new();
+    for i in issues {
+        let s = i.range.start.max(line_start);
+        let e = i.range.end.min(line_end);
+        if s < e {
+            spans.push((s - line_start, e - line_start, i.severity));
+        }
+    }
+    if spans.is_empty() {
+        return vec![Segment {
+            text: line_text.to_string(),
+            hit: None,
+        }];
+    }
+    // 起点升序；同起点更严重（Error<Warning<Hint 的 Ord，取 min 即更严重）在前。
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    for (s, e, sev) in spans {
+        if e <= cursor {
+            continue; // 完全被前一命中盖住
+        }
+        let s = s.max(cursor);
+        if s > cursor
+            && let Some(t) = line_text.get(cursor..s)
+        {
+            out.push(Segment {
+                text: t.to_string(),
+                hit: None,
+            });
+        }
+        if let Some(t) = line_text.get(s..e) {
+            out.push(Segment {
+                text: t.to_string(),
+                hit: Some(sev),
+            });
+        }
+        cursor = e;
+    }
+    if cursor < line_text.len()
+        && let Some(t) = line_text.get(cursor..)
+    {
+        out.push(Segment {
+            text: t.to_string(),
+            hit: None,
+        });
+    }
+    out
+}
+
 pub struct ProofPanel {
     /// 全部问题，已按位置排序。
     issues: Vec<Issue>,
@@ -287,5 +353,101 @@ mod tests {
         assert!(p.remove_current().is_none());
         p.move_down();
         assert_eq!(p.cursor(), 0);
+    }
+
+    // ---- 正文着色分段 ----
+
+    #[test]
+    fn segments_split_line_around_a_hit() {
+        // "他如火如茶了" 中 "如火如茶" 在字节 3..15。
+        let line = "他如火如茶了";
+        let start = line.find("如火如茶").unwrap();
+        let segs = line_segments(
+            line,
+            0,
+            &[issue(
+                "typo.confusion",
+                Severity::Warning,
+                0.9,
+                start..start + "如火如茶".len(),
+            )],
+        );
+        assert_eq!(segs.len(), 3);
+        assert_eq!(
+            segs[0],
+            Segment {
+                text: "他".into(),
+                hit: None
+            }
+        );
+        assert_eq!(
+            segs[1],
+            Segment {
+                text: "如火如茶".into(),
+                hit: Some(Severity::Warning)
+            }
+        );
+        assert_eq!(
+            segs[2],
+            Segment {
+                text: "了".into(),
+                hit: None
+            }
+        );
+    }
+
+    #[test]
+    fn segments_respect_line_offset() {
+        // 第二行首字节偏移不为 0：命中用整章坐标，切段要减去行基址。
+        let line = "如火如茶";
+        let base = 30;
+        let segs = line_segments(
+            line,
+            base,
+            &[issue("t", Severity::Error, 0.9, base..base + line.len())],
+        );
+        assert_eq!(
+            segs,
+            vec![Segment {
+                text: "如火如茶".into(),
+                hit: Some(Severity::Error)
+            }]
+        );
+    }
+
+    #[test]
+    fn no_hit_yields_whole_line() {
+        let segs = line_segments("平平无奇的一行", 0, &[]);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].hit.is_none());
+    }
+
+    #[test]
+    fn overlapping_hits_take_more_severe() {
+        let line = "如火如茶";
+        let segs = line_segments(
+            line,
+            0,
+            &[
+                issue("a", Severity::Hint, 0.5, 0..line.len()),
+                issue("b", Severity::Warning, 0.9, 0..3),
+            ],
+        );
+        // 前 3 字节（"如"）两条命中重叠，取更严重的 Warning。
+        assert_eq!(segs[0].hit, Some(Severity::Warning));
+    }
+
+    #[test]
+    fn hit_crossing_line_boundary_is_clipped() {
+        // 命中 0..9 但本行只覆盖字节 0..6（"如火"）。
+        let line = "如火";
+        let segs = line_segments(line, 0, &[issue("t", Severity::Warning, 0.9, 0..9)]);
+        assert_eq!(
+            segs,
+            vec![Segment {
+                text: "如火".into(),
+                hit: Some(Severity::Warning)
+            }]
+        );
     }
 }
