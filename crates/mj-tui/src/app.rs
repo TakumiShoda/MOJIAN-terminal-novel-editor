@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::batch::{BatchJob, BatchKind, BatchUndo, Scope};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
+use crate::screens::character_form::CharacterForm;
 use crate::screens::character_panel::CharacterPanel;
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
@@ -78,6 +79,8 @@ struct Workspace {
     proof_issues: Vec<mj_text::proof::Issue>,
     /// 角色速查侧栏（Alt+C，§6.7）。同上，M6 并入浮层栈。
     character: Option<CharacterPanel>,
+    /// 角色卡表单编辑（角色面板里按 e，§6.7）。同上。
+    character_form: Option<CharacterForm>,
 }
 
 impl Workspace {
@@ -351,6 +354,7 @@ impl App {
             proof: None,
             proof_issues: Vec::new(),
             character: None,
+            character_form: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -386,6 +390,9 @@ impl App {
         }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.proof.is_some()) {
             return self.on_key_proof(code);
+        }
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.character_form.is_some()) {
+            return self.on_key_character_form(code, mods);
         }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.character.is_some()) {
             return self.on_key_character(code, mods);
@@ -1291,6 +1298,9 @@ impl App {
             KeyCode::Char('d') if !self.character_searching() => {
                 return self.delete_character();
             }
+            KeyCode::Char('e') if !self.character_searching() => {
+                return self.edit_character();
+            }
             _ => {}
         }
 
@@ -1364,6 +1374,100 @@ impl App {
             ws.character = Some(CharacterPanel::new(chars));
         }
         self.toast = Some(format!("已删除「{name}」（在 trash 内，可找回）"));
+        Ok(())
+    }
+
+    /// `e`：编辑当前角色，打开表单（§6.7 [MUST] 表单式编辑）。
+    fn edit_character(&mut self) -> anyhow::Result<()> {
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(c) = ws.character.as_ref().and_then(|p| p.current()).cloned()
+        {
+            ws.character_form = Some(CharacterForm::new(c));
+            ws.character = None; // 表单盖住列表；存/退时再回列表
+        }
+        Ok(())
+    }
+
+    fn on_key_character_form(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // Ctrl+S 存盘要脱离对 ws 的借用。
+        if code == KeyCode::Char('s') && mods.contains(KeyModifiers::CONTROL) {
+            return self.save_character_form();
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(form) = &mut ws.character_form else {
+            return Ok(());
+        };
+
+        if form.is_editing() {
+            match code {
+                KeyCode::Esc => form.stop_editing(),
+                KeyCode::Enter => {
+                    if form.focused_field().key.is_multiline() {
+                        form.input_newline();
+                    } else {
+                        form.stop_editing();
+                    }
+                }
+                KeyCode::Backspace => form.backspace(),
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => form.input_char(c),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match code {
+            // 退表单：改了没存要给个提醒，但不拦——列表还能再进来（M6 浮层栈里再做确认）。
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let dirty = form.is_dirty();
+                self.close_character_form()?;
+                if dirty {
+                    self.toast = Some("已放弃未保存的改动".into());
+                }
+                return Ok(());
+            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => form.next_field(),
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => form.prev_field(),
+            KeyCode::Enter | KeyCode::Char('i') => form.start_editing(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Ctrl+S：把表单写回角色卡。
+    fn save_character_form(&mut self) -> anyhow::Result<()> {
+        let (book, character) = {
+            let Screen::Workspace(ws) = &self.screen else {
+                return Ok(());
+            };
+            let Some(form) = &ws.character_form else {
+                return Ok(());
+            };
+            (ws.book.id, form.to_character())
+        };
+        self.store.save_character(book, &character)?;
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(form) = &mut ws.character_form
+        {
+            form.mark_saved();
+        }
+        self.toast = Some(format!("已保存「{}」", character.name));
+        Ok(())
+    }
+
+    /// 关表单，回到角色列表（重新载入，反映刚存的改动）。
+    fn close_character_form(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        let chars = self.store.list_characters(book).unwrap_or_default();
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.character_form = None;
+            ws.character = Some(CharacterPanel::new(chars));
+        }
         Ok(())
     }
 
@@ -2252,6 +2356,8 @@ impl App {
                     render_format_preview(frame, body, p);
                 } else if let Some(p) = &mut ws.proof {
                     render_proof(frame, body, p);
+                } else if let Some(fm) = &mut ws.character_form {
+                    render_character_form(frame, body, fm);
                 } else if let Some(p) = &mut ws.character {
                     render_characters(frame, body, p);
                 } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
@@ -2283,13 +2389,25 @@ impl App {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
                 }
+                Screen::Workspace(ws) if ws.character_form.is_some() => {
+                    let editing = ws.character_form.as_ref().is_some_and(|f| f.is_editing());
+                    if editing {
+                        spans.push(Span::raw(
+                            " 编辑字段 │ 输入内容 │ Enter 换行/完成 │ Esc 结束本字段 ",
+                        ));
+                    } else {
+                        spans.push(Span::raw(
+                            " 角色卡 │ Tab/j/k 换字段 │ Enter/i 编辑 │ Ctrl+S 保存 │ Esc 返回 ",
+                        ));
+                    }
+                }
                 Screen::Workspace(ws) if ws.character.is_some() => {
                     let searching = ws.character.as_ref().is_some_and(|p| p.is_searching());
                     if searching {
                         spans.push(Span::raw(" 搜索角色 │ 输入筛选 │ Enter/Esc 结束搜索 "));
                     } else {
                         spans.push(Span::raw(
-                            " 角色 │ j/k 移动 │ / 搜索 │ n 新建 │ d 删除 │ Esc 关闭 ",
+                            " 角色 │ j/k 移动 │ / 搜索 │ n 新建 │ e 编辑 │ d 删除 │ Esc 关闭 ",
                         ));
                     }
                 }
@@ -3064,6 +3182,66 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     if focused && let Some((col, row)) = open.viewport.cursor_screen_pos(&open.buffer) {
         frame.set_cursor_position((inner.x + col, inner.y + row));
     }
+}
+
+/// 角色卡表单编辑（§6.7）。字段逐行，聚焦项高亮，编辑态末尾加光标符。
+fn render_character_form(frame: &mut ratatui::Frame, area: Rect, form: &mut CharacterForm) {
+    let dirty = if form.is_dirty() { " ●未保存" } else { "" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" 编辑角色{dirty} "))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, field) in form.fields().iter().enumerate() {
+        let focused = i == form.focus();
+        let editing = focused && form.is_editing();
+        let label_style = if focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let marker = if focused { "▸ " } else { "  " };
+        // 多行值可能含换行；首行跟在标签后，其余行缩进对齐。
+        let mut value_lines = field.value.split('\n');
+        let first = value_lines.next().unwrap_or("");
+        let cursor = if editing { "▏" } else { "" };
+        let val_style = if editing {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{}：", field.key.label()), label_style),
+            Span::styled(
+                format!(
+                    "{first}{}",
+                    if value_lines.clone().next().is_none() {
+                        cursor
+                    } else {
+                        ""
+                    }
+                ),
+                val_style,
+            ),
+        ]));
+        for (n, extra) in value_lines.clone().enumerate() {
+            let is_last = value_lines.clone().count() == n + 1;
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "      {extra}{}",
+                    if editing && is_last { cursor } else { "" }
+                ),
+                val_style,
+            )));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 角色速查侧栏 / 列表页（Alt+C，§6.7）。宽屏左列表右详情，窄屏只列表。

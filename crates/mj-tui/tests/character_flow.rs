@@ -49,6 +49,11 @@ impl Fixture {
     fn character_count(&self) -> usize {
         self.store().list_characters(self.book).unwrap().len()
     }
+
+    fn first_character(&self) -> mj_core::model::Character {
+        let mut list = self.store().list_characters(self.book).unwrap();
+        list.remove(0)
+    }
 }
 
 fn open_panel(app: &mut App) {
@@ -130,6 +135,63 @@ fn esc_closes_panel() {
     assert_eq!(app.character_filtered_for_test(), None);
 }
 
+/// e 进表单，编辑身份字段，Ctrl+S 存盘——磁盘上的卡应更新。
+#[test]
+fn edit_form_saves_field_to_disk() {
+    let f = setup(&["沈砚"]);
+    let mut app = f.app();
+    open_panel(&mut app);
+    // e 进表单。
+    app.press_for_test(KeyCode::Char('e'), NONE).unwrap();
+    // 移到「身份」字段（名字, 别名, 身份 = 两次 Tab）。
+    app.press_for_test(KeyCode::Tab, NONE).unwrap();
+    app.press_for_test(KeyCode::Tab, NONE).unwrap();
+    // 进编辑，输入「主角」，Enter 完成。
+    app.press_for_test(KeyCode::Char('i'), NONE).unwrap();
+    for c in "主角".chars() {
+        app.press_for_test(KeyCode::Char(c), NONE).unwrap();
+    }
+    app.press_for_test(KeyCode::Enter, NONE).unwrap();
+    // Ctrl+S 保存。
+    app.press_for_test(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    let c = f.first_character();
+    assert_eq!(c.role, "主角", "身份字段应已存到磁盘");
+}
+
+/// 编辑别名字段（、分隔），存盘后应拆成列表。
+#[test]
+fn edit_form_splits_aliases_on_save() {
+    let f = setup(&["沈砚"]);
+    let mut app = f.app();
+    open_panel(&mut app);
+    app.press_for_test(KeyCode::Char('e'), NONE).unwrap();
+    app.press_for_test(KeyCode::Tab, NONE).unwrap(); // 别名字段
+    app.press_for_test(KeyCode::Char('i'), NONE).unwrap();
+    for c in "沈公子、小砚".chars() {
+        app.press_for_test(KeyCode::Char(c), NONE).unwrap();
+    }
+    app.press_for_test(KeyCode::Esc, NONE).unwrap(); // 结束字段编辑
+    app.press_for_test(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        .unwrap();
+
+    let c = f.first_character();
+    assert_eq!(c.aliases, vec!["沈公子", "小砚"]);
+}
+
+/// 存盘后编辑的名字驱动校对：改名后一致性检查用的是新名。
+#[test]
+fn esc_from_form_returns_to_list() {
+    let f = setup(&["沈砚"]);
+    let mut app = f.app();
+    open_panel(&mut app);
+    app.press_for_test(KeyCode::Char('e'), NONE).unwrap();
+    assert_eq!(app.character_filtered_for_test(), None, "表单里列表不可见");
+    app.press_for_test(KeyCode::Esc, NONE).unwrap();
+    assert_eq!(app.character_filtered_for_test(), Some(1), "Esc 回到列表");
+}
+
 fn draw_ok(app: &mut App, w: u16, h: u16) -> bool {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| app.render_for_test(f)).unwrap();
@@ -148,5 +210,16 @@ fn panel_renders_across_widths() {
         let mut app = f.app();
         open_panel(&mut app);
         assert!(draw_ok(&mut app, w, h), "角色面板在 {w}x{h} 撕屏了");
+    }
+}
+
+#[test]
+fn form_renders_across_widths() {
+    let f = setup(&["沈砚"]);
+    for (w, h) in [(60, 20), (80, 24), (120, 30), (200, 50)] {
+        let mut app = f.app();
+        open_panel(&mut app);
+        app.press_for_test(KeyCode::Char('e'), NONE).unwrap();
+        assert!(draw_ok(&mut app, w, h), "角色表单在 {w}x{h} 撕屏了");
     }
 }
