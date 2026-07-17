@@ -73,4 +73,13 @@ impl EventLoop {
     pub fn next(&self) -> Result<AppEvent, RecvError> {
         self.rx.recv()
     }
+
+    /// 取事件，没有就立刻返回 None。
+    ///
+    /// 批量作业（全书排版/替换）跑的时候用它：主循环不能停在 `recv` 上
+    /// 干等，否则进度条不动、Esc 也按不了；但也不能不理按键——
+    /// §6.5 要求「可中断」。故干一小块活、瞄一眼有没有按键，如此往复。
+    pub fn try_next(&self) -> Option<AppEvent> {
+        self.rx.try_recv().ok()
+    }
 }

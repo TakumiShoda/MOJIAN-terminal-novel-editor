@@ -1,8 +1,10 @@
 //! 查找替换面板。见 doc.md §6.6、§7.3（Ctrl+F / Ctrl+H）。
 //!
-//! M3 只做**当前章**范围。全书替换按 §6.6 是 `[MUST] 执行前强制打快照`，
-//! 而快照属 M4（§6.9）——没有快照就提供全书替换，等于让用户拿整本书赌一次
-//! 正则没写错。宁可暂时不给，也不给一个退不回去的。
+//! 范围（F4）：当前章 / 当前卷 / 全书。
+//!
+//! 全书替换一度不敢给——§6.6 的 `[MUST]` 是「执行前强制打快照」+「撤销本次
+//! 批量替换」，而快照直到 M4 才有。没有快照就让人替换整本书，等于拿全书赌一次
+//! 正则没写错。M4 之后两条都兑现了，这才放开。
 //!
 //! 状态与渲染分离：这里只管「查什么、找到了什么、勾了哪些」，绘制在 app.rs。
 
@@ -26,6 +28,12 @@ pub struct SearchPanel {
     pub flags: MatchFlags,
     /// Ctrl+H 进来的（带替换栏）；Ctrl+F 只查找。
     pub replace_mode: bool,
+    /// 作业范围（§6.6）。F4 切换。
+    ///
+    /// 结果列表只显示**当前章**的命中——跨章的结果树（§6.6 的「书→卷→章分组」）
+    /// 要先把全书读进内存，那是 M6 索引搜索的活。这里 scope 只影响**替换**
+    /// 落到哪些章：范围本身是诚实的，界面上写明「替换 N 章」。
+    pub scope: crate::batch::Scope,
     field: Field,
     hits: Vec<HitContext>,
     checked: HashSet<usize>,
@@ -44,6 +52,7 @@ impl SearchPanel {
             mode: MatchMode::default(),
             flags: MatchFlags::default(),
             replace_mode,
+            scope: crate::batch::Scope::Chapter,
             field: Field::Query,
             hits: Vec::new(),
             checked: HashSet::new(),
@@ -235,7 +244,8 @@ impl SearchPanel {
         };
         let on = |b: bool| if b { "✓" } else { " " };
         format!(
-            "模式:{mode}(F2切换) [{}]忽略大小写(F6) [{}]全半角(F7) [{}]中文标点(F8)",
+            "范围:{}(F4) 模式:{mode}(F2) [{}]大小写(F6) [{}]全半角(F7) [{}]中文标点(F8)",
+            self.scope.label(),
             on(self.flags.ignore_case),
             on(self.flags.fold_width),
             on(self.flags.fold_cjk_punct),

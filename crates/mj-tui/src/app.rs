@@ -17,8 +17,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::batch::{BatchJob, BatchKind, BatchUndo, Scope};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
+use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
 use crate::screens::search_panel::{self, SearchPanel};
@@ -63,6 +65,10 @@ struct Workspace {
     history: Option<HistoryPanel>,
     /// diff 视图（历史面板里 Enter 打开，§6.9）。同上。
     diff: Option<DiffView>,
+    /// 正在跑的批量作业（全卷/全书排版或替换，§6.5/§6.6）。
+    batch: Option<BatchJob>,
+    /// 宽范围作业的确认框。同上，M6 并入浮层栈。
+    confirm: Option<Confirm>,
 }
 
 impl Workspace {
@@ -115,6 +121,8 @@ pub struct App {
     /// 上次快照的时刻与当时的字数。自动快照要「每 N 分钟**且**净变更 ≥ M 字」，
     /// 两个条件都得记着。切章时重置——那是另一条历史线。
     last_snapshot: Option<(std::time::Instant, usize)>,
+    /// 上一次批量操作的回滚记录（§6.6 [MUST]「撤销本次批量替换」）。
+    batch_undo: Option<BatchUndo>,
 }
 
 impl App {
@@ -132,6 +140,7 @@ impl App {
             toast: None,
             today_words: 0,
             last_snapshot: None,
+            batch_undo: None,
         })
     }
 
@@ -230,6 +239,21 @@ impl App {
                 self.dirty = false;
             }
 
+            // 批量作业进行中：不能停在 recv 上干等，否则进度条不动、Esc 按不了。
+            // 干一小块活、瞄一眼按键，如此往复（§6.5 [MUST] 可中断）。
+            if matches!(&self.screen, Screen::Workspace(ws) if ws.batch.is_some()) {
+                if let Some(AppEvent::Term(Event::Key(k))) = events.try_next()
+                    && k.kind == KeyEventKind::Press
+                    && matches!(k.code, KeyCode::Esc)
+                    && let Screen::Workspace(ws) = &mut self.screen
+                    && let Some(job) = &mut ws.batch
+                {
+                    job.cancel();
+                }
+                self.step_batch()?;
+                continue;
+            }
+
             match events.next()? {
                 AppEvent::Term(Event::Key(k)) if k.kind == KeyEventKind::Press => {
                     self.on_key(k.code, k.modifiers)?;
@@ -310,6 +334,8 @@ impl App {
             search: None,
             history: None,
             diff: None,
+            batch: None,
+            confirm: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -327,6 +353,10 @@ impl App {
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         // 浮层打开时它吃掉所有按键（浮层语义，§7.1）。
+        // 确认框最靠上：它是从查找面板/排版预览上叠出来的。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.confirm.is_some()) {
+            return self.on_key_confirm(code);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.diff.is_some()) {
             return self.on_key_diff(code);
         }
@@ -391,6 +421,10 @@ impl App {
             KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
                 return self.save_current();
             }
+            // Alt+U：撤销刚做完的那次批量作业（§6.6 [MUST]）。
+            KeyCode::Char('u') if mods.contains(KeyModifiers::ALT) => {
+                return self.undo_batch();
+            }
             KeyCode::Tab => {
                 if let Screen::Workspace(ws) = &mut self.screen {
                     ws.focus = match ws.focus {
@@ -412,6 +446,302 @@ impl App {
             Focus::Tree => self.on_key_tree(code, mods),
             Focus::Editor => self.on_key_editor(code, mods),
         }
+    }
+
+    // ---- 批量作业（§6.5 全卷/全书排版、§6.6 全卷/全书替换）----
+
+    /// 收集范围内的章。
+    fn chapters_in_scope(&self, scope: Scope) -> Vec<ChapterId> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Vec::new();
+        };
+        let current = ws.editor.as_ref().map(|o| o.id);
+
+        // 受损章一律跳过（ADR 0004）：它的 front matter 读不出来，
+        // 硬写回去等于把还能人工救的内容覆盖掉。
+        let ok = |c: &&mj_core::model::ChapterMeta| c.damaged.is_none();
+
+        match scope {
+            Scope::Chapter => current.into_iter().collect(),
+            Scope::Volume => current
+                .and_then(|ch| ws.book.find_chapter(ch))
+                .map(|(v, _)| v.chapters.iter().filter(ok).map(|c| c.id).collect())
+                .unwrap_or_default(),
+            Scope::Book => ws
+                .book
+                .volumes
+                .iter()
+                .flat_map(|v| &v.chapters)
+                .filter(ok)
+                .map(|c| c.id)
+                .collect(),
+        }
+    }
+
+    /// 宽范围作业先过一道确认；当前章范围直接开跑。
+    fn confirm_batch(&mut self, kind: BatchKind, scope: Scope) -> anyhow::Result<()> {
+        if !scope.is_wide() {
+            return self.start_batch(kind, scope);
+        }
+        let n = self.chapters_in_scope(scope).len();
+        if n == 0 {
+            self.toast = Some("范围内没有可处理的章节".into());
+            return Ok(());
+        }
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.confirm = Some(Confirm::new(kind, scope, n));
+        }
+        Ok(())
+    }
+
+    /// 确认框上的按键。
+    fn on_key_confirm(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(c) = &mut ws.confirm else {
+            return Ok(());
+        };
+        match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => c.toggle(),
+            KeyCode::Esc | KeyCode::Char('n') => ws.confirm = None,
+            KeyCode::Enter | KeyCode::Char('y') => {
+                // 'y' 是明示的「就是要」，不看光标停在哪。
+                let go = code == KeyCode::Char('y') || c.is_yes();
+                let Some(c) = ws.confirm.take() else {
+                    return Ok(());
+                };
+                if go {
+                    return self.start_batch(c.kind, c.scope);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 启动一个批量作业。
+    fn start_batch(&mut self, kind: BatchKind, scope: Scope) -> anyhow::Result<()> {
+        // 先把当前章存了——批量作业直接读写磁盘，缓冲里没落盘的字会被绕过去。
+        self.save_current()?;
+
+        let chapters = self.chapters_in_scope(scope);
+        if chapters.is_empty() {
+            self.toast = Some("范围内没有可处理的章节".into());
+            return Ok(());
+        }
+        let job = BatchJob::new(kind, scope, chapters);
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.format_preview = None;
+            ws.search = None;
+            ws.batch = Some(job);
+        }
+        Ok(())
+    }
+
+    /// 推进批量作业。
+    ///
+    /// 每次只干一小会儿（`BATCH_SLICE`）就返回，让主循环有机会重绘进度条、
+    /// 响应 Esc（§6.5 `[MUST]` 可中断）。**每章独立事务**：快照 → 改 → 存，
+    /// 一章一轮；中途中断的话，做完的那些章各自都是完整的。
+    fn step_batch(&mut self) -> anyhow::Result<()> {
+        const BATCH_SLICE: std::time::Duration = std::time::Duration::from_millis(30);
+        let deadline = std::time::Instant::now() + BATCH_SLICE;
+
+        loop {
+            let Screen::Workspace(ws) = &mut self.screen else {
+                return Ok(());
+            };
+            let Some(job) = &mut ws.batch else {
+                return Ok(());
+            };
+            if job.is_done() {
+                return self.finish_batch();
+            }
+            let Some(ch) = job.next_chapter() else {
+                return self.finish_batch();
+            };
+
+            let book = ws.book.id;
+            if let Err(e) = self.process_one(book, ch) {
+                // 一章出错不该让整本书的操作前功尽弃。
+                if let Screen::Workspace(ws) = &mut self.screen
+                    && let Some(job) = &mut ws.batch
+                {
+                    job.record_failure(ch, e.to_string());
+                }
+                tracing::warn!(chapter = %ch, error = %e, "批量作业跳过一章");
+            }
+            self.dirty = true;
+
+            if std::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+        }
+    }
+
+    /// 处理一章：快照 → 改 → 存。
+    fn process_one(&mut self, book: BookId, ch: ChapterId) -> anyhow::Result<()> {
+        let (kind, retention) = {
+            let Screen::Workspace(ws) = &self.screen else {
+                return Ok(());
+            };
+            let Some(job) = &ws.batch else { return Ok(()) };
+            (job.kind.clone(), self.config.history.retention)
+        };
+
+        let body = self.store.load_body(book, ch)?;
+        let text = body.text.to_string();
+
+        // 算出新正文。
+        let new_text = match &kind {
+            BatchKind::Format(opts) => mj_text::format::format(&text, opts),
+            BatchKind::Replace { query, to } => {
+                let edits = mj_text::search::replace_preview(&text, query, to)?;
+                if edits.is_empty() {
+                    text.clone()
+                } else {
+                    mj_text::format::apply(&text, &edits)
+                }
+            }
+        };
+
+        if new_text == text {
+            if let Screen::Workspace(ws) = &mut self.screen
+                && let Some(job) = &mut ws.batch
+            {
+                job.record_unchanged();
+            }
+            return Ok(());
+        }
+
+        // §6.6 [MUST]：执行前每章各打一条快照。
+        let snap = self
+            .history_of(book)
+            .snapshot(ch, &text, kind.trigger(), None, retention)?;
+        // 去重时 snapshot 返回 None——那说明链上最后一条就是当前内容，
+        // 拿它的 id 即可（内容寻址：id 就是内容的哈希）。
+        let before = snap
+            .map(|s| s.id)
+            .unwrap_or_else(|| mj_core::history::SnapshotId::of(&text));
+
+        self.store
+            .save_body(book, &mj_core::model::ChapterBody::new(ch, &new_text))?;
+
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(job) = &mut ws.batch
+        {
+            job.record_change(ch, before);
+        }
+        Ok(())
+    }
+
+    /// 作业收工。
+    fn finish_batch(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(job) = ws.batch.take() else {
+            return Ok(());
+        };
+        let summary = job.summary();
+        let undo = BatchUndo::from_job(&job);
+        let book = ws.book.id;
+
+        self.batch_undo = undo;
+        // 元数据变了（字数），重载让树跟上。
+        if let Ok(b) = self.store.load_book(book)
+            && let Screen::Workspace(ws) = &mut self.screen
+        {
+            ws.book = b;
+        }
+        // 当前章的正文可能被改过了——重新载入，否则缓冲还是旧的，
+        // 一保存就把批量的结果覆盖回去。
+        let current = match &self.screen {
+            Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.id),
+            _ => None,
+        };
+        if let Some(id) = current {
+            self.open_chapter(id)?;
+        }
+        self.toast = Some(summary);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Alt+U：撤销本次批量操作（§6.6 `[MUST]`）。
+    ///
+    /// 一次性把所有受影响的章回滚到操作前的快照。
+    fn undo_batch(&mut self) -> anyhow::Result<()> {
+        if self.batch_undo.is_none() {
+            self.toast = Some("没有可撤销的批量操作".into());
+            return Ok(());
+        }
+
+        // 撤销本身也是破坏性的：它拿快照盖掉磁盘上现在的内容。
+        //
+        // 批量跑完之后用户完全可能又在当前章写了几段——那些字不在任何快照里，
+        // 直接回滚就是 §0 的「静默丢稿」。故先落盘 + 打一条快照，
+        // 撤销之后仍能从 F8 里把它捞回来。别的章没开编辑器，动不了，
+        // 它们的操作前状态本来就在快照里。
+        self.save_current()?;
+        self.take_snapshot(
+            mj_core::history::Trigger::Manual,
+            Some("撤销批量操作前".into()),
+        );
+
+        let Some(undo) = self.batch_undo.take() else {
+            return Ok(());
+        };
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        let h = self.history_of(book);
+
+        let mut ok = 0usize;
+        let mut failed = 0usize;
+        for (ch, snap) in &undo.entries {
+            match h.read(snap) {
+                Ok(old) => {
+                    match self
+                        .store
+                        .save_body(book, &mj_core::model::ChapterBody::new(*ch, &old))
+                    {
+                        Ok(()) => ok += 1,
+                        Err(e) => {
+                            failed += 1;
+                            tracing::warn!(chapter = %ch, error = %e, "批量撤销：写回失败");
+                        }
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(chapter = %ch, error = %e, "批量撤销：读不出快照");
+                }
+            }
+        }
+
+        if let Ok(b) = self.store.load_book(book)
+            && let Screen::Workspace(ws) = &mut self.screen
+        {
+            ws.book = b;
+        }
+        let current = match &self.screen {
+            Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.id),
+            _ => None,
+        };
+        if let Some(id) = current {
+            self.open_chapter(id)?;
+        }
+
+        self.toast = Some(if failed == 0 {
+            format!("已撤销本次{}，{ok} 章回到操作前", undo.kind_label)
+        } else {
+            // 据实说哪几章没退回去——用户得知道去历史面板手动处理。
+            format!("撤销了 {ok} 章，{failed} 章失败（见日志，可在 F8 历史里手动恢复）")
+        });
+        Ok(())
     }
 
     // ---- 版本历史（§6.9）----
@@ -744,6 +1074,16 @@ impl App {
             _ => {}
         }
 
+        // F4 切范围（§6.6）。
+        if code == KeyCode::F(4) {
+            if let Screen::Workspace(ws) = &mut self.screen
+                && let Some(p) = &mut ws.search
+            {
+                p.scope = p.scope.next();
+            }
+            return Ok(());
+        }
+
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
@@ -839,6 +1179,29 @@ impl App {
         let Some(p) = &mut ws.search else {
             return Ok(());
         };
+
+        // 范围超出当前章：走批量作业，勾选与否不作数。
+        //
+        // 结果列表里只有当前章的命中，勾选是**这一章**的事；全卷/全书的命中
+        // 从没在界面上出现过，拿当前章的勾选去推别的章是没有依据的。所以宽范围
+        // 一律「全换」，并在确认框里把话说明白。
+        if p.scope.is_wide() {
+            if p.query.is_empty() {
+                self.toast = Some("先输入要查找的内容".into());
+                return Ok(());
+            }
+            let kind = BatchKind::Replace {
+                query: mj_text::search::Query {
+                    pattern: p.query.clone(),
+                    mode: p.mode,
+                    flags: p.flags,
+                },
+                to: p.replace_with.clone(),
+            };
+            let scope = p.scope;
+            return self.confirm_batch(kind, scope);
+        }
+
         let edits = p.checked_edits();
         if edits.is_empty() {
             self.toast = Some("没有勾选任何命中".into());
@@ -903,6 +1266,21 @@ impl App {
         // Enter 要改正文，得先脱离对 ws 的借用。
         if code == KeyCode::Enter {
             return self.apply_format();
+        }
+        // V / B：把同一套规则施加到当前卷 / 全书（§6.5 [MUST] 范围）。
+        //
+        // 不做逐条预览：全书四百章的改动列表没人看得完，
+        // 而 §6.5 给的保障是「进度条 + 可中断 + 每章打快照」，不是预览。
+        match code {
+            KeyCode::Char('V') => {
+                let opts = self.config.format.clone();
+                return self.confirm_batch(BatchKind::Format(opts), Scope::Volume);
+            }
+            KeyCode::Char('B') => {
+                let opts = self.config.format.clone();
+                return self.confirm_batch(BatchKind::Format(opts), Scope::Book);
+            }
+            _ => {}
         }
 
         let Screen::Workspace(ws) = &mut self.screen else {
@@ -1338,6 +1716,87 @@ impl App {
         self.render(frame);
     }
 
+    /// 供测试：直接送一个按键进真正的分发路径。
+    ///
+    /// 比起再加一个 `press_xxx_for_demo`，这个能测到**键位本身**——
+    /// 一个只在 demo 钩子里跑过的功能，等于没验证过用户按得到它。
+    /// （Ctrl+Shift+S 那次就是这么漏的，见 doc.md §7.3。）
+    #[doc(hidden)]
+    pub fn press_for_test(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        self.on_key(code, mods)
+    }
+
+    /// 供测试：跑到批量作业结束（真实主循环是分片跑的，这里一次跑完）。
+    #[doc(hidden)]
+    pub fn drain_batch_for_test(&mut self) -> anyhow::Result<()> {
+        for _ in 0..10_000 {
+            if !matches!(&self.screen, Screen::Workspace(ws) if ws.batch.is_some()) {
+                return Ok(());
+            }
+            self.step_batch()?;
+        }
+        anyhow::bail!("批量作业没有收敛")
+    }
+
+    /// 供测试：当前的 toast 文本。
+    #[doc(hidden)]
+    pub fn toast_for_test(&self) -> Option<&str> {
+        self.toast.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn confirm_open_for_test(&self) -> bool {
+        matches!(&self.screen, Screen::Workspace(ws) if ws.confirm.is_some())
+    }
+
+    /// 供测试：把编辑焦点切到指定章（决定「当前章/当前卷」范围）。
+    #[doc(hidden)]
+    pub fn open_chapter_for_test(&mut self, ch: ChapterId) -> anyhow::Result<()> {
+        self.open_chapter(ch)
+    }
+
+    /// 供测试：当前打开的章。
+    #[doc(hidden)]
+    pub fn current_chapter_for_test(&self) -> Option<ChapterId> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.id),
+            _ => None,
+        }
+    }
+
+    /// 供测试：查找面板当前的作业范围。
+    #[doc(hidden)]
+    pub fn search_scope_for_test(&self) -> Option<Scope> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.search.as_ref().map(|p| p.scope),
+            _ => None,
+        }
+    }
+
+    /// 供测试：设置替换栏的内容。
+    #[doc(hidden)]
+    pub fn set_replace_text_for_test(&mut self, to: &str) {
+        if let Screen::Workspace(ws) = &mut self.screen
+            && let Some(p) = &mut ws.search
+        {
+            p.replace_with = to.to_string();
+        }
+    }
+
+    /// 供测试：某章全部快照的正文。
+    #[doc(hidden)]
+    pub fn snapshot_texts_for_test(&mut self, ch: ChapterId) -> Vec<String> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Vec::new();
+        };
+        let book = ws.book.id;
+        let h = self.history_of(book);
+        h.list(ch)
+            .iter()
+            .filter_map(|s| h.read(&s.id).ok())
+            .collect()
+    }
+
     /// 供测试与截图：打开查找面板并输入查找串。
     #[doc(hidden)]
     pub fn open_search_for_demo(&mut self, replace: bool, query: &str) {
@@ -1415,7 +1874,9 @@ impl App {
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
             Screen::Workspace(ws) => {
-                if let Some(v) = &mut ws.diff {
+                if let Some(job) = &ws.batch {
+                    render_batch(frame, body, job);
+                } else if let Some(v) = &mut ws.diff {
                     render_diff(frame, body, v);
                 } else if let Some(p) = &mut ws.history {
                     render_history(frame, body, p);
@@ -1430,6 +1891,14 @@ impl App {
                 }
             }
         }
+
+        // 确认框叠在上面那层之上——它是从查找面板/排版预览上弹出来的。
+        if let Screen::Workspace(ws) = &self.screen
+            && let Some(c) = &ws.confirm
+        {
+            render_confirm(frame, body, c);
+        }
+
         self.render_status(frame, status);
     }
 
@@ -1444,6 +1913,12 @@ impl App {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
                 }
+                Screen::Workspace(ws) if ws.confirm.is_some() => {
+                    spans.push(Span::raw(" ←/→ 选择 │ Enter 确定 │ y 执行 │ Esc 取消 "));
+                }
+                Screen::Workspace(ws) if ws.batch.is_some() => {
+                    spans.push(Span::raw(" 批量作业进行中 │ Esc 中断 "));
+                }
                 Screen::Workspace(ws) if ws.diff.is_some() => {
                     // §12.4 的底栏。
                     spans.push(Span::raw(
@@ -1456,10 +1931,15 @@ impl App {
                     ));
                 }
                 Screen::Workspace(ws) if ws.search.is_some() => {
-                    let hint = if ws.search.as_ref().is_some_and(|s| s.replace_mode) {
-                        " 查找替换 │ Tab 切换栏 │ Space 勾选 │ Alt+R 替换本条 │ Alt+A 替换勾选 │ Enter 跳转 │ Esc 关闭 "
-                    } else {
+                    let wide = ws.search.as_ref().is_some_and(|s| s.scope.is_wide());
+                    let hint = if !ws.search.as_ref().is_some_and(|s| s.replace_mode) {
                         " 查找 │ Tab 切到结果 │ Enter 跳转 │ Esc 关闭 "
+                    } else if wide {
+                        // 宽范围下勾选管不到别的章，Alt+R 也只作用于当前章——
+                        // 底栏就别再提它们，免得暗示它们跟范围有关。
+                        " 查找替换 │ Tab 切换栏 │ F4 范围 │ Alt+A 替换该范围全部 │ Esc 关闭 "
+                    } else {
+                        " 查找替换 │ Tab 切换栏 │ F4 范围 │ Space 勾选 │ Alt+R 替换本条 │ Alt+A 替换勾选 │ Esc 关闭 "
                     };
                     spans.push(Span::raw(hint));
                 }
@@ -1538,6 +2018,15 @@ impl App {
                     spans.push(Span::raw(
                         "│ Ctrl+S 保存 │ F5 排版 │ F8 历史 │ F9 快照 │ Esc 返回 ",
                     ));
+
+                    // 刚做完批量作业：把撤销的入口摆在眼前（§6.6 [MUST]）。
+                    // 埋在帮助里的撤销，等于没有。
+                    if let Some(u) = &self.batch_undo {
+                        spans.push(Span::styled(
+                            format!("│ Alt+U {} ", u.describe()),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
                     if frame.area().width < NARROW_THRESHOLD {
@@ -1856,6 +2345,86 @@ fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatP
 }
 
 /// 统计面板（§6.4 [MUST]：按卷/章列出双口径字数，可导出 CSV）。
+/// 批量作业进行中：进度条 + 中断提示（§6.5 `[MUST]`）。
+fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {}中… ", job.kind.label()))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // 进度条留出 "[]" 和 " 999/999 章" 的位置。
+    let bar_width = (inner.width as usize).saturating_sub(16).clamp(4, 60);
+    let lines = vec![
+        Line::from(format!("范围：{}", job.scope.label())),
+        Line::raw(""),
+        Line::from(Span::styled(
+            job.progress_line(bar_width),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Esc 中断（已完成的章保留）",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 宽范围作业的确认框。居中浮层，盖在底下那层上。
+fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm) {
+    let lines = c.lines();
+    // 宽度按最长一行算（CJK 占两格），高度按行数——内容多大就多大，
+    // 不让「全书 200 章」这种关键数字被截掉。
+    let want_w = lines
+        .iter()
+        .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(20)
+        .max(30) as u16
+        + 4;
+    let want_h = lines.len() as u16 + 4; // 边框 2 + 空行 1 + 按钮行 1
+    let w = want_w.min(area.width);
+    let h = want_h.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", c.title()))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [text_area, btn_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(body), text_area);
+
+    // 选中的那个反白。默认停在「取消」。
+    let sel = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let plain = Style::default().fg(Color::DarkGray);
+    let btns = Line::from(vec![
+        Span::styled("  取消 (Esc)  ", if c.is_yes() { plain } else { sel }),
+        Span::raw("   "),
+        Span::styled("  执行 (y)  ", if c.is_yes() { sel } else { plain }),
+    ]);
+    frame.render_widget(
+        Paragraph::new(btns).alignment(ratatui::layout::Alignment::Center),
+        btn_area,
+    );
+}
+
 fn render_stats(
     frame: &mut ratatui::Frame,
     area: Rect,
