@@ -18,6 +18,12 @@ pub struct Config {
     pub general: General,
     #[serde(default)]
     pub editor: Editor,
+    /// 排版规则开关（§6.5 规则表、§8 `[format]`）。
+    ///
+    /// 直接复用 mj-text 的 `FormatOptions`：规则表就是它的字段，
+    /// 再包一层只会让「配置里写的」与「排版真正用的」有机会走偏。
+    #[serde(default)]
+    pub format: mj_text::format::FormatOptions,
     #[serde(default)]
     pub history: History,
     #[serde(default)]

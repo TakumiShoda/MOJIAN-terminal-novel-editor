@@ -250,6 +250,76 @@ impl Buffer {
         );
     }
 
+    /// 一次性替换多个区间，**整体算一个撤销组**（§6.5：一次排版 = 一个撤销组）。
+    ///
+    /// `edits` 必须互不重叠（`format::plan` 已保证）。内部按起点倒序施加，
+    /// 免得前面的改动让后面的偏移失效。
+    ///
+    /// 为什么不能循环调 `replace_range`：那会产生 N 个撤销组，用户排完版
+    /// 得按 N 次 Ctrl+Z 才退得干净——而他心里那是**一次**操作。
+    pub fn replace_ranges(&mut self, edits: &[(std::ops::Range<usize>, String)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let cursor_before = self.cursor;
+
+        // **按起点升序施加，并把后续偏移按已产生的长度差校正。**
+        //
+        // 这样每条 Change 的 `at` 都落在「它被施加时」的坐标系里——与打字产生的
+        // Change 语义一致。撤销栈的回放依赖这条不变量：`undo` 倒着 revert
+        // （高位先还原，低位的 at 才不会失效），`redo` 正着 edit。
+        // 若改成倒序施加、`at` 记原文坐标，redo 就会正着重放一串倒序坐标，直接错乱。
+        let mut sorted: Vec<_> = edits.iter().collect();
+        sorted.sort_by_key(|(r, _)| r.start);
+
+        let mut changes = Vec::with_capacity(sorted.len());
+        let mut delta: isize = 0;
+
+        for (range, with) in sorted {
+            let at = (range.start as isize + delta).max(0) as usize;
+            let end = (range.end as isize + delta).max(0) as usize;
+
+            // 区间与当前文本对不上就跳过——排版失败顶多是没排上，
+            // 不该把用户的正文搞坏（§0 禁令 1）。
+            let ok = at <= end
+                && end <= self.text.len_bytes()
+                && self.text.try_byte_to_char(at).is_ok()
+                && self.text.try_byte_to_char(end).is_ok();
+            if !ok {
+                tracing::warn!(?range, "排版编辑区间与正文对不上，跳过");
+                continue;
+            }
+
+            let change = Change {
+                at,
+                removed: self.slice_to_string(at..end),
+                inserted: with.clone(),
+                cursor_before,
+            };
+            self.edit(&change);
+            delta += with.len() as isize - (end - at) as isize;
+            changes.push(change);
+        }
+        if changes.is_empty() {
+            return;
+        }
+
+        // 一个组，装下全部改动。
+        self.undo.push(UndoGroup {
+            changes,
+            kind: Kind::Bulk,
+            last_edit: Instant::now(),
+        });
+        while self.undo.len() > self.undo_depth {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.dirty = true;
+        self.anchor = None;
+        // 光标可能落在被删掉的区间里，夹回合法位置。
+        self.cursor = self.clamp_to_boundary(self.cursor.min(self.text.len_bytes()));
+    }
+
     fn apply(&mut self, change: Change, kind: Kind) {
         self.edit(&change);
         self.push_undo(change, kind);
@@ -705,6 +775,114 @@ mod tests {
                 b.cursor()
             );
         }
+    }
+
+    // ---- replace_ranges（排版/批量替换）----
+
+    /// §6.5：一次排版 = 一个撤销组。
+    #[test]
+    fn replace_ranges_is_one_undo_group() {
+        let mut b = buf("aXbXc");
+        b.replace_ranges(&[(1..2, "1".into()), (3..4, "2".into())]);
+        assert_eq!(b.contents(), "a1b2c");
+
+        assert!(b.undo());
+        assert_eq!(b.contents(), "aXbXc", "一次撤销应退掉全部改动");
+        assert!(!b.undo(), "不该还有第二个组");
+    }
+
+    #[test]
+    fn replace_ranges_redo_restores() {
+        let mut b = buf("aXbXc");
+        b.replace_ranges(&[(1..2, "1".into()), (3..4, "2".into())]);
+        b.undo();
+        assert!(b.redo());
+        assert_eq!(b.contents(), "a1b2c", "重做应还原全部改动");
+    }
+
+    /// 改动长度不一时，后续区间要按已产生的长度差校正。
+    #[test]
+    fn replace_ranges_handles_length_changes() {
+        let mut b = buf("aXbXc");
+        // 第一处变长（1→3 字节），第二处的原文坐标 3..4 要相应右移。
+        b.replace_ranges(&[(1..2, "111".into()), (3..4, "2".into())]);
+        assert_eq!(b.contents(), "a111b2c");
+
+        b.undo();
+        assert_eq!(b.contents(), "aXbXc", "长度变化下撤销仍要逐字还原");
+    }
+
+    /// 删除（替换为空）同样要校正后续偏移。
+    #[test]
+    fn replace_ranges_handles_deletions() {
+        let mut b = buf("a雪b雪c");
+        let text = b.contents();
+        let first = text.find('雪').unwrap();
+        let second = text.rfind('雪').unwrap();
+        b.replace_ranges(&[
+            (first..first + 3, String::new()),
+            (second..second + 3, "X".into()),
+        ]);
+        assert_eq!(b.contents(), "abXc");
+        b.undo();
+        assert_eq!(b.contents(), "a雪b雪c");
+    }
+
+    #[test]
+    fn replace_ranges_with_cjk_roundtrips() {
+        let original = "　　雪落了一夜。他推开门。";
+        let mut b = buf(original);
+        let pos = original.find('。').unwrap();
+        b.replace_ranges(&[(pos..pos + 3, "……".into())]);
+        assert!(b.contents().contains("……"));
+        b.undo();
+        assert_eq!(b.contents(), original, "中文正文必须逐字还原");
+    }
+
+    #[test]
+    fn replace_ranges_empty_is_noop() {
+        let mut b = buf("abc");
+        b.replace_ranges(&[]);
+        assert!(!b.is_dirty(), "空编辑不该弄脏缓冲");
+        assert!(!b.undo(), "空编辑不该产生撤销组");
+    }
+
+    /// 区间对不上时跳过而非 panic——正文比排版重要。
+    #[test]
+    fn replace_ranges_skips_bad_ranges() {
+        let mut b = buf("abc");
+        b.replace_ranges(&[(100..200, "X".into())]);
+        assert_eq!(b.contents(), "abc", "越界区间应被跳过");
+    }
+
+    /// 乱序传入也要正确——调用方不该被迫先排序。
+    #[test]
+    fn replace_ranges_accepts_unsorted_input() {
+        let mut b = buf("aXbXc");
+        b.replace_ranges(&[(3..4, "2".into()), (1..2, "1".into())]);
+        assert_eq!(b.contents(), "a1b2c");
+    }
+
+    /// 与 format::plan 对接：plan 的输出喂进来，结果必须与 format 一致。
+    #[test]
+    fn replace_ranges_matches_format_output() {
+        let text = "雪落了一夜...  \n\n\n\n他推开门,风灌进来!  \n";
+        let opts = mj_text::format::FormatOptions::default();
+        let edits: Vec<_> = mj_text::format::plan(text, &opts)
+            .into_iter()
+            .map(|e| (e.range, e.new))
+            .collect();
+
+        let mut b = buf(text);
+        b.replace_ranges(&edits);
+        assert_eq!(
+            b.contents(),
+            mj_text::format::format(text, &opts),
+            "缓冲里的结果必须与纯函数排版一致"
+        );
+
+        b.undo();
+        assert_eq!(b.contents(), text, "撤销应完整回到排版前");
     }
 
     // ---- 选区 ----

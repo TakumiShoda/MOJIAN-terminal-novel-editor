@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
+use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
 use crate::screens::tree::{Row, Tree};
@@ -52,6 +53,8 @@ struct Workspace {
     /// Option 表示。M6 接入浮层栈时这里会并进去——但那不该拖着
     /// §6.4 的 [MUST] 一起等。
     stats: Option<Stats>,
+    /// 排版预览面板（F5，§6.5 [MUST]）。同上，M6 并入浮层栈。
+    format_preview: Option<FormatPreview>,
 }
 
 impl Workspace {
@@ -291,6 +294,7 @@ impl App {
             focus: Focus::Tree,
             show_tree: true,
             stats: None,
+            format_preview: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -307,13 +311,18 @@ impl App {
     // ---- 工作区 ----
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        // 统计面板打开时它吃掉所有按键（浮层语义，§7.1）。
+        // 浮层打开时它吃掉所有按键（浮层语义，§7.1）。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.format_preview.is_some()) {
+            return self.on_key_format_preview(code);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.stats.is_some()) {
             return self.on_key_stats(code);
         }
 
         // 先处理全局键。
         match code {
+            // F5 一键排版（当前章，弹预览）——§7.3 键位表。
+            KeyCode::F(5) => return self.open_format_preview(),
             // F3 打开统计面板（§6.4 [MUST]）。
             // §7.3 的键位表没给它分配键——F5/F7/F8 已被排版/校对/历史占用，
             // F3 空着且相邻，故取之。M6 做命令面板时会有正式入口。
@@ -356,6 +365,89 @@ impl App {
             Focus::Tree => self.on_key_tree(code, mods),
             Focus::Editor => self.on_key_editor(code, mods),
         }
+    }
+
+    // ---- 排版（§6.5）----
+
+    /// F5：对当前章生成排版计划并弹出预览。
+    fn open_format_preview(&mut self) -> anyhow::Result<()> {
+        let opts = self.config.format.clone();
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &ws.editor else {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        };
+
+        let text = open.buffer.contents();
+        let edits = mj_text::format::plan(&text, &opts);
+
+        if edits.is_empty() {
+            // 说清楚「没有改动」，而不是弹一个空面板让用户猜。
+            self.toast = Some("本章已符合排版规则，无需改动".into());
+            return Ok(());
+        }
+        ws.format_preview = Some(FormatPreview::new(&text, edits));
+        Ok(())
+    }
+
+    /// 排版预览的按键（§6.5：可逐条取消）。
+    fn on_key_format_preview(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // Enter 要改正文，得先脱离对 ws 的借用。
+        if code == KeyCode::Enter {
+            return self.apply_format();
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.format_preview else {
+            return Ok(());
+        };
+
+        match code {
+            KeyCode::Esc | KeyCode::F(5) | KeyCode::Char('q') => ws.format_preview = None,
+            KeyCode::Down | KeyCode::Char('j') => p.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => p.move_up(),
+            KeyCode::Char(' ') => p.toggle(),
+            KeyCode::Char('a') => p.set_all(true),
+            KeyCode::Char('n') => p.set_all(false),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 应用勾选的排版改动。
+    fn apply_format(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = ws.format_preview.take() else {
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+
+        let edits = p.selected_edits();
+        if edits.is_empty() {
+            self.toast = Some("没有勾选任何改动".into());
+            return Ok(());
+        }
+
+        // §6.5：一次排版 = 一个撤销组。Ctrl+Z 一次退干净。
+        //
+        // §6.5 还要求「执行前强制打快照」——快照属 M4（§6.9），尚未实现。
+        // 在那之前，撤销栈是唯一的后路：故这里绝不能退化成 N 个撤销组。
+        let n = edits.len();
+        open.buffer.replace_ranges(&edits);
+        open.word_count = mj_text::count::count(&open.buffer.contents());
+        open.autosave.on_edit(std::time::Instant::now());
+        open.viewport.scroll_to_cursor(&open.buffer);
+
+        self.toast = Some(format!("已排版 {n} 处，Ctrl+Z 可整体撤销"));
+        Ok(())
     }
 
     /// 统计面板的按键（§6.4）。
@@ -728,6 +820,12 @@ impl App {
         self.render(frame);
     }
 
+    /// 供测试与截图：按 F5 打开排版预览。
+    #[doc(hidden)]
+    pub fn press_f5_for_demo(&mut self) -> anyhow::Result<()> {
+        self.open_format_preview()
+    }
+
     /// 供测试与截图：打开统计面板。
     #[doc(hidden)]
     pub fn open_stats_for_demo(&mut self) {
@@ -762,10 +860,15 @@ impl App {
 
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
-            Screen::Workspace(ws) => match (&ws.stats, stats_rows) {
-                (Some(st), Some(rows)) => render_stats(frame, body, st, &rows, &ws.book.title),
-                _ => render_workspace(frame, body, ws),
-            },
+            Screen::Workspace(ws) => {
+                if let Some(p) = &mut ws.format_preview {
+                    render_format_preview(frame, body, p);
+                } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
+                    render_stats(frame, body, st, &rows, &ws.book.title);
+                } else {
+                    render_workspace(frame, body, ws);
+                }
+            }
         }
         self.render_status(frame, status);
     }
@@ -780,6 +883,11 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.format_preview.is_some() => {
+                    spans.push(Span::raw(
+                        " 排版预览 │ Space 逐条取消 │ a 全选 │ n 全不选 │ Enter 应用 │ Esc 放弃 ",
+                    ));
                 }
                 Screen::Workspace(ws) if ws.stats.is_some() => {
                     spans.push(Span::raw(" 统计面板 │ e 导出 CSV │ ↑↓ 滚动 │ Esc 关闭 "));
@@ -848,7 +956,7 @@ impl App {
                         }
                         spans.push(Span::raw(" "));
                     }
-                    spans.push(Span::raw("│ Ctrl+S 保存 │ F3 统计 │ Esc 返回 "));
+                    spans.push(Span::raw("│ Ctrl+S 保存 │ F3 统计 │ F5 排版 │ Esc 返回 "));
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
                     if frame.area().width < NARROW_THRESHOLD {
@@ -930,6 +1038,46 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) 
         render_tree(frame, ta, ws);
     }
     render_editor(frame, editor_area, ws);
+}
+
+/// 排版预览（§6.5 [MUST]：显示将改动的位置与条数，可逐条取消）。
+fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatPreview) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 排版预览 · 共 {} 处，已选 {} 处 ",
+            p.len(),
+            p.included_count()
+        ))
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    p.set_height(inner.height as usize);
+
+    let lines: Vec<Line> = p
+        .items()
+        .iter()
+        .enumerate()
+        .skip(p.scroll())
+        .take(inner.height as usize)
+        .map(|(i, item)| {
+            let text = format_preview::render_item(item);
+            let mut style = if item.include {
+                Style::default()
+            } else {
+                // 取消掉的条目压暗——一眼看出它不会被应用。
+                Style::default().fg(Color::DarkGray)
+            };
+            if i == p.cursor() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::styled(text, style)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 统计面板（§6.4 [MUST]：按卷/章列出双口径字数，可导出 CSV）。
