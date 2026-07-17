@@ -3,6 +3,7 @@
 pub mod atomic;
 pub mod chapter_file;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod history;
 pub mod id;

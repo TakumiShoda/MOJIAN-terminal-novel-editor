@@ -300,6 +300,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1519,10 +1520,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "unicode-segmentation",
  "windows-sys 0.59.0",
  "zstd",
 ]

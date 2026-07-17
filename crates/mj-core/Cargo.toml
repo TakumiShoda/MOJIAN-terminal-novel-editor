@@ -8,6 +8,9 @@ description = "领域模型、磁盘存储、索引、版本历史。不依赖 r
 
 [dependencies]
 mj-text.workspace = true
+unicode-segmentation.workspace = true
+# 两级 diff（§6.9）。§3 把 similar 列在技术栈里，本就是给历史用的。
+similar.workspace = true
 
 ropey.workspace = true
 serde.workspace = true
