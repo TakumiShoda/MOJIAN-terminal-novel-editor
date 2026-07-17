@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::format_preview::{self, FormatPreview};
+use crate::screens::search_panel::{self, SearchPanel};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
 use crate::screens::tree::{Row, Tree};
@@ -55,6 +56,8 @@ struct Workspace {
     stats: Option<Stats>,
     /// 排版预览面板（F5，§6.5 [MUST]）。同上，M6 并入浮层栈。
     format_preview: Option<FormatPreview>,
+    /// 查找替换面板（Ctrl+F / Ctrl+H，§6.6）。同上。
+    search: Option<SearchPanel>,
 }
 
 impl Workspace {
@@ -295,6 +298,7 @@ impl App {
             show_tree: true,
             stats: None,
             format_preview: None,
+            search: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -312,6 +316,9 @@ impl App {
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         // 浮层打开时它吃掉所有按键（浮层语义，§7.1）。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.search.is_some()) {
+            return self.on_key_search(code, mods);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.format_preview.is_some()) {
             return self.on_key_format_preview(code);
         }
@@ -323,6 +330,13 @@ impl App {
         match code {
             // F5 一键排版（当前章，弹预览）——§7.3 键位表。
             KeyCode::F(5) => return self.open_format_preview(),
+            // Ctrl+F 查找 / Ctrl+H 查找替换（§7.3）。
+            KeyCode::Char('f') if mods.contains(KeyModifiers::CONTROL) => {
+                return self.open_search(false);
+            }
+            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+                return self.open_search(true);
+            }
             // F3 打开统计面板（§6.4 [MUST]）。
             // §7.3 的键位表没给它分配键——F5/F7/F8 已被排版/校对/历史占用，
             // F3 空着且相邻，故取之。M6 做命令面板时会有正式入口。
@@ -365,6 +379,152 @@ impl App {
             Focus::Tree => self.on_key_tree(code, mods),
             Focus::Editor => self.on_key_editor(code, mods),
         }
+    }
+
+    // ---- 查找替换（§6.6）----
+
+    /// Ctrl+F / Ctrl+H。
+    fn open_search(&mut self, replace_mode: bool) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        if ws.editor.is_none() {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        }
+        ws.search = Some(SearchPanel::new(replace_mode));
+        Ok(())
+    }
+
+    /// 查找面板的按键。
+    fn on_key_search(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // 会改正文的两个动作要先脱离对 ws 的借用。
+        match code {
+            KeyCode::Char('r') if mods.contains(KeyModifiers::ALT) => return self.replace_one(),
+            KeyCode::Char('a') if mods.contains(KeyModifiers::ALT) => {
+                return self.replace_checked();
+            }
+            _ => {}
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.search else {
+            return Ok(());
+        };
+        let text = ws.editor.as_ref().map(|o| o.buffer.contents());
+
+        let mut need_refresh = false;
+        match code {
+            KeyCode::Esc => {
+                ws.search = None;
+                return Ok(());
+            }
+            KeyCode::Tab => p.next_field(),
+            // Enter：跳到当前命中处（§6.6）。
+            KeyCode::Enter => {
+                let target = p.current_hit().map(|h| h.range.start);
+                if let Some(pos) = target {
+                    ws.search = None;
+                    if let Some(open) = &mut ws.editor {
+                        open.buffer.move_to(pos);
+                        open.viewport.scroll_to_cursor(&open.buffer);
+                        ws.focus = Focus::Editor;
+                    }
+                }
+                return Ok(());
+            }
+            KeyCode::Down => p.move_down(),
+            KeyCode::Up => p.move_up(),
+            KeyCode::Char(' ') if p.field() == search_panel::Field::Results => p.toggle_check(),
+            KeyCode::Backspace => need_refresh = p.backspace(),
+            KeyCode::F(2) => {
+                p.cycle_mode();
+                need_refresh = true;
+            }
+            KeyCode::F(6) => {
+                p.flags.ignore_case = !p.flags.ignore_case;
+                need_refresh = true;
+            }
+            KeyCode::F(7) => {
+                p.flags.fold_width = !p.flags.fold_width;
+                need_refresh = true;
+            }
+            KeyCode::F(8) => {
+                p.flags.fold_cjk_punct = !p.flags.fold_cjk_punct;
+                need_refresh = true;
+            }
+            KeyCode::Char(c) => need_refresh = p.input_char(c),
+            _ => {}
+        }
+
+        // §6.6：非法正则**实时**提示——故每次改动都重查。
+        if need_refresh && let Some(t) = &text {
+            p.refresh(t);
+        }
+        Ok(())
+    }
+
+    /// Alt+R：只替换当前这一条。
+    fn replace_one(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.search else {
+            return Ok(());
+        };
+        let Some(edit) = p.current_edit() else {
+            self.toast = Some("没有可替换的命中".into());
+            return Ok(());
+        };
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+
+        open.buffer.replace_ranges(&[edit]);
+        let text = open.buffer.contents();
+        open.word_count = mj_text::count::count(&text);
+        open.autosave.on_edit(std::time::Instant::now());
+
+        // 正文变了，命中的坐标全失效——必须立刻重查，
+        // 否则下一次替换会砍在错的位置上。
+        p.refresh(&text);
+        self.toast = Some("已替换 1 处".into());
+        Ok(())
+    }
+
+    /// Alt+A：替换全部勾选（§6.6）。
+    fn replace_checked(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.search else {
+            return Ok(());
+        };
+        let edits = p.checked_edits();
+        if edits.is_empty() {
+            self.toast = Some("没有勾选任何命中".into());
+            return Ok(());
+        }
+        let Some(open) = &mut ws.editor else {
+            return Ok(());
+        };
+
+        // 一次批量替换 = 一个撤销组（与排版同理，§6.3）。
+        //
+        // 本章范围内撤销栈就够了。§6.6 要求的「全书替换前强制打快照」
+        // 与「撤销本次批量替换」依赖快照（M4 §6.9），故全书范围暂不提供——
+        // 没有快照就让人替换整本书，等于拿全书赌一次正则没写错。
+        let n = edits.len();
+        open.buffer.replace_ranges(&edits);
+        let text = open.buffer.contents();
+        open.word_count = mj_text::count::count(&text);
+        open.autosave.on_edit(std::time::Instant::now());
+
+        p.refresh(&text);
+        self.toast = Some(format!("已替换 {n} 处，Ctrl+Z 可整体撤销"));
+        Ok(())
     }
 
     // ---- 排版（§6.5）----
@@ -820,6 +980,24 @@ impl App {
         self.render(frame);
     }
 
+    /// 供测试与截图：打开查找面板并输入查找串。
+    #[doc(hidden)]
+    pub fn open_search_for_demo(&mut self, replace: bool, query: &str) {
+        let _ = self.open_search(replace);
+        if let Screen::Workspace(ws) = &mut self.screen {
+            let text = ws
+                .editor
+                .as_ref()
+                .map(|o| o.buffer.contents())
+                .unwrap_or_default();
+            if let Some(p) = &mut ws.search {
+                p.query = query.to_string();
+                p.replace_with = "霜".to_string();
+                p.refresh(&text);
+            }
+        }
+    }
+
     /// 供测试与截图：按 F5 打开排版预览。
     #[doc(hidden)]
     pub fn press_f5_for_demo(&mut self) -> anyhow::Result<()> {
@@ -861,7 +1039,9 @@ impl App {
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
             Screen::Workspace(ws) => {
-                if let Some(p) = &mut ws.format_preview {
+                if let Some(p) = &mut ws.search {
+                    render_search(frame, body, p);
+                } else if let Some(p) = &mut ws.format_preview {
                     render_format_preview(frame, body, p);
                 } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
                     render_stats(frame, body, st, &rows, &ws.book.title);
@@ -883,6 +1063,14 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.search.is_some() => {
+                    let hint = if ws.search.as_ref().is_some_and(|s| s.replace_mode) {
+                        " 查找替换 │ Tab 切换栏 │ Space 勾选 │ Alt+R 替换本条 │ Alt+A 替换勾选 │ Enter 跳转 │ Esc 关闭 "
+                    } else {
+                        " 查找 │ Tab 切到结果 │ Enter 跳转 │ Esc 关闭 "
+                    };
+                    spans.push(Span::raw(hint));
                 }
                 Screen::Workspace(ws) if ws.format_preview.is_some() => {
                     spans.push(Span::raw(
@@ -956,7 +1144,9 @@ impl App {
                         }
                         spans.push(Span::raw(" "));
                     }
-                    spans.push(Span::raw("│ Ctrl+S 保存 │ F3 统计 │ F5 排版 │ Esc 返回 "));
+                    spans.push(Span::raw(
+                        "│ Ctrl+S 保存 │ Ctrl+F 查找 │ F5 排版 │ Esc 返回 ",
+                    ));
 
                     // §7.2：窄屏隐藏侧栏时要在状态栏提示。
                     if frame.area().width < NARROW_THRESHOLD {
@@ -1038,6 +1228,110 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) 
         render_tree(frame, ta, ws);
     }
     render_editor(frame, editor_area, ws);
+}
+
+/// 查找替换面板（§6.6）。
+fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
+    let title = if p.replace_mode {
+        " 查找替换 · 当前章 "
+    } else {
+        " 查找 · 当前章 "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // 输入栏（1~2 行） + 选项行 + 摘要行 + 结果列表
+    let input_rows = if p.replace_mode { 2 } else { 1 };
+    let [inputs, options, summary, results] = Layout::vertical([
+        Constraint::Length(input_rows),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    // 输入栏：当前焦点用 ▸ 标出——没有光标的输入框，用户不知道在敲哪。
+    let mut input_lines = vec![Line::from(field_line(
+        "查找",
+        &p.query,
+        p.field() == search_panel::Field::Query,
+    ))];
+    if p.replace_mode {
+        input_lines.push(Line::from(field_line(
+            "替换",
+            &p.replace_with,
+            p.field() == search_panel::Field::Replace,
+        )));
+    }
+    frame.render_widget(Paragraph::new(input_lines), inputs);
+
+    frame.render_widget(
+        Paragraph::new(p.options_line()).style(Style::default().fg(Color::DarkGray)),
+        options,
+    );
+
+    // 摘要：命中数，或非法正则的实时提示（§6.6 [MUST]）。
+    let summary_style = if p.error().is_some() {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    frame.render_widget(Paragraph::new(p.summary()).style(summary_style), summary);
+
+    p.set_height(results.height as usize);
+
+    let focused = p.field() == search_panel::Field::Results;
+    let lines: Vec<Line> = p
+        .hits()
+        .iter()
+        .enumerate()
+        .skip(p.scroll())
+        .take(results.height as usize)
+        .map(|(i, h)| {
+            let check = if p.is_checked(i) { "✓" } else { " " };
+            // 命中处高亮：把上下文按 highlight 切三段。
+            let before = h.context.get(..h.highlight.start).unwrap_or("");
+            let hit = h.context.get(h.highlight.clone()).unwrap_or("");
+            let after = h.context.get(h.highlight.end..).unwrap_or("");
+
+            let base = if i == p.cursor() && focused {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{check} 第{}行 ", h.line), base),
+                Span::styled(before.to_string(), base),
+                Span::styled(
+                    hit.to_string(),
+                    base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(after.to_string(), base),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), results);
+}
+
+/// 一行输入框。有焦点的那行用 ▸ 与下划线标出。
+fn field_line(label: &str, value: &str, focused: bool) -> Vec<Span<'static>> {
+    let marker = if focused { "▸" } else { " " };
+    let style = if focused {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    vec![
+        Span::raw(format!("{marker} {label}: ")),
+        Span::styled(value.to_string(), style),
+        // 光标提示：终端光标被正文占着，这里用一个块字符代替。
+        Span::styled(if focused { "▏" } else { "" }, style),
+    ]
 }
 
 /// 排版预览（§6.5 [MUST]：显示将改动的位置与条数，可逐条取消）。

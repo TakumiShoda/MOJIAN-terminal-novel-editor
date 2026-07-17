@@ -1,11 +1,13 @@
 //! 各屏幕：shelf / tree / editor / diff / proof / character / settings。见 doc.md §7。
 
 pub mod format_preview;
+pub mod search_panel;
 pub mod shelf;
 pub mod stats;
 pub mod tree;
 
 pub use format_preview::FormatPreview;
+pub use search_panel::SearchPanel;
 pub use shelf::Shelf;
 pub use stats::Stats;
 pub use tree::Tree;
