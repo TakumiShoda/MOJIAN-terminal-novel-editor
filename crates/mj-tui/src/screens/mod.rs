@@ -2,6 +2,7 @@
 
 pub mod character_form;
 pub mod character_panel;
+pub mod completion;
 pub mod confirm;
 pub mod format_preview;
 pub mod history_panel;
@@ -13,6 +14,7 @@ pub mod tree;
 
 pub use character_form::CharacterForm;
 pub use character_panel::CharacterPanel;
+pub use completion::Completion;
 pub use confirm::Confirm;
 pub use format_preview::FormatPreview;
 pub use history_panel::{DiffView, HistoryPanel};

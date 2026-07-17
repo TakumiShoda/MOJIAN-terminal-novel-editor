@@ -22,6 +22,7 @@ use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::character_form::CharacterForm;
 use crate::screens::character_panel::CharacterPanel;
+use crate::screens::completion::Completion;
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
@@ -81,6 +82,8 @@ struct Workspace {
     character: Option<CharacterPanel>,
     /// 角色卡表单编辑（角色面板里按 e，§6.7）。同上。
     character_form: Option<CharacterForm>,
+    /// 正文里 `@` 触发的角色名补全（§6.7 [SHOULD]）。
+    completion: Option<Completion>,
 }
 
 impl Workspace {
@@ -355,6 +358,7 @@ impl App {
             proof_issues: Vec::new(),
             character: None,
             character_form: None,
+            completion: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -1867,7 +1871,128 @@ impl App {
         Ok(())
     }
 
+    /// @ 补全激活时的按键处理。返回 true = 本次按键已被补全吃掉，编辑器不再处理。
+    ///
+    /// 过滤串是 `@` 之后到光标之间那段正文（实时躺在缓冲里，不另存）。
+    fn handle_completion_key(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<bool> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(false);
+        };
+        let (Some(comp), Some(open)) = (&mut ws.completion, &mut ws.editor) else {
+            return Ok(false);
+        };
+        let at = comp.at();
+        let cursor = open.buffer.cursor();
+        // 光标退到 `@` 或更前：补全作废。
+        if cursor <= at {
+            ws.completion = None;
+            return Ok(false);
+        }
+        let filter = open
+            .buffer
+            .contents()
+            .get(at + 1..cursor)
+            .unwrap_or("")
+            .to_string();
+
+        // 编辑后统一收尾。
+        let finish_edit = |open: &mut OpenChapter, issues: &mut Vec<mj_text::proof::Issue>| {
+            open.word_count = mj_text::count::count(&open.buffer.contents());
+            open.autosave.on_edit(std::time::Instant::now());
+            issues.clear();
+            open.viewport.scroll_to_cursor(&open.buffer);
+        };
+
+        match code {
+            KeyCode::Up => {
+                comp.move_up();
+                Ok(true)
+            }
+            KeyCode::Down => {
+                comp.move_down(&filter);
+                Ok(true)
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                if let Some(name) = comp.selected(&filter) {
+                    // 用所选名字替换 `@` + 过滤串。
+                    open.buffer.replace_ranges(&[(at..cursor, name.clone())]);
+                    open.buffer.move_to(at + name.len());
+                    finish_edit(open, &mut ws.proof_issues);
+                }
+                ws.completion = None;
+                Ok(true)
+            }
+            KeyCode::Esc => {
+                // 取消补全，留下字面 `@文本`。
+                ws.completion = None;
+                Ok(true)
+            }
+            KeyCode::Backspace => {
+                open.buffer.delete_backward();
+                let nc = open.buffer.cursor();
+                if nc <= at {
+                    ws.completion = None;
+                } else {
+                    let f = open
+                        .buffer
+                        .contents()
+                        .get(at + 1..nc)
+                        .unwrap_or("")
+                        .to_string();
+                    comp.clamp(&f);
+                }
+                finish_edit(open, &mut ws.proof_issues);
+                Ok(true)
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) && !c.is_whitespace() => {
+                open.buffer.insert(&c.to_string());
+                let nc = open.buffer.cursor();
+                let f = open
+                    .buffer
+                    .contents()
+                    .get(at + 1..nc)
+                    .unwrap_or("")
+                    .to_string();
+                // 敲到没有任何候选就退出补全（用户在打的不是名字）。
+                if comp.candidates(&f).is_empty() {
+                    ws.completion = None;
+                } else {
+                    comp.clamp(&f);
+                }
+                finish_edit(open, &mut ws.proof_issues);
+                Ok(true)
+            }
+            // 其余键（空格、方向左右等）：关补全，让编辑器照常处理这次按键。
+            _ => {
+                ws.completion = None;
+                Ok(false)
+            }
+        }
+    }
+
     fn on_key_editor(&mut self, code: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+        // @ 补全激活时先给它处理；它可能吃掉本次按键。
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.completion.is_some())
+            && self.handle_completion_key(code, _mods)?
+        {
+            return Ok(());
+        }
+
+        // 敲 `@` 前把角色名备好（放在可变借用 ws 之前，避开借用冲突）。
+        let at_names = if code == KeyCode::Char('@') && !_mods.contains(KeyModifiers::CONTROL) {
+            match &self.screen {
+                Screen::Workspace(ws) => {
+                    let book = ws.book.id;
+                    mj_core::proofing::build_context(&self.store, self.store.workspace(), book)
+                        .map(|c| c.names)
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
@@ -1910,6 +2035,11 @@ impl App {
                     open.buffer.insert(&c.to_string());
                 }
                 edited = true;
+                // 敲了 `@` 且有角色可选 → 开补全（§6.7）。
+                if c == '@' && !at_names.is_empty() {
+                    let at = open.buffer.cursor().saturating_sub('@'.len_utf8());
+                    ws.completion = Some(Completion::new(at, at_names.clone()));
+                }
             }
             KeyCode::Enter => {
                 open.buffer.insert("\n");
@@ -2021,8 +2151,9 @@ impl App {
             saved_words,
         });
         ws.tree.focus_chapter(&ws.book, id);
-        // 换章：上一章的校对命中作废，清掉下划线。
+        // 换章：上一章的校对命中作废，清掉下划线；补全也作废。
         ws.proof_issues.clear();
+        ws.completion = None;
         // 换了一章就是另一条历史线，自动快照的基准要跟着重置。
         self.last_snapshot = None;
         Ok(())
@@ -2195,6 +2326,12 @@ impl App {
             Screen::Workspace(ws) => ws.editor.as_ref().map(|o| o.buffer.contents()),
             _ => None,
         }
+    }
+
+    /// 供测试：@ 补全是否激活。
+    #[doc(hidden)]
+    pub fn completion_active_for_test(&self) -> bool {
+        matches!(&self.screen, Screen::Workspace(ws) if ws.completion.is_some())
     }
 
     /// 供测试：角色面板里筛选后的数量（None = 面板没开）。
@@ -3133,8 +3270,9 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // 校对命中集（不同字段，与下面对 editor 的可变借用不冲突）。
+    // 校对命中集、补全状态（不同字段，与下面对 editor 的可变借用不冲突）。
     let issues = &ws.proof_issues;
+    let completion = ws.completion.as_ref();
 
     let Some(open) = &mut ws.editor else {
         frame.render_widget(
@@ -3178,9 +3316,75 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
 
     frame.render_widget(Paragraph::new(lines), inner);
 
+    let cursor_pos = open.viewport.cursor_screen_pos(&open.buffer);
+
     // 光标只在编辑器有焦点时显示。
-    if focused && let Some((col, row)) = open.viewport.cursor_screen_pos(&open.buffer) {
+    if focused && let Some((col, row)) = cursor_pos {
         frame.set_cursor_position((inner.x + col, inner.y + row));
+    }
+
+    // @ 补全弹框（§6.7）：贴着光标下方列候选。
+    if let (Some(comp), Some((col, row))) = (completion, cursor_pos) {
+        let cursor = open.buffer.cursor();
+        let at = comp.at();
+        let filter = if cursor > at {
+            open.buffer
+                .contents()
+                .get(at + 1..cursor)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let cands = comp.candidates(&filter);
+        if !cands.is_empty() {
+            let shown = cands.len().min(6);
+            let popup_w = cands
+                .iter()
+                .take(shown)
+                .map(|s| unicode_width::UnicodeWidthStr::width(*s))
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 24) as u16
+                + 2;
+            let popup_h = shown as u16 + 2;
+            // 光标下方；贴着底或右边时上移/左移，别出界。
+            let x = (inner.x + col).min(inner.x + inner.width.saturating_sub(popup_w));
+            let below = inner.y + row + 1;
+            let y = if below + popup_h <= inner.y + inner.height {
+                below
+            } else {
+                (inner.y + row).saturating_sub(popup_h)
+            };
+            let pw = popup_w.min(area.width);
+            let ph = popup_h.min(area.height);
+            let popup = Rect {
+                x,
+                y,
+                width: pw,
+                height: ph,
+            };
+            frame.render_widget(ratatui::widgets::Clear, popup);
+            let pblock = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            let pinner = pblock.inner(popup);
+            frame.render_widget(pblock, popup);
+            let items: Vec<Line> = cands
+                .iter()
+                .take(shown)
+                .enumerate()
+                .map(|(i, name)| {
+                    let style = if i == comp.cursor() {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    Line::styled((*name).to_string(), style)
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(items), pinner);
+        }
     }
 }
 
