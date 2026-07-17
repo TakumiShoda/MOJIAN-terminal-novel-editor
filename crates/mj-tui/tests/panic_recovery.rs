@@ -2,14 +2,29 @@
 //!
 //! 这些测试必须真的 panic 一次——「hook 装了」和「hook 起作用了」是两回事。
 //!
-//! panic hook 是进程级的，本文件各测试共享它。之所以能并行跑而不打架，
-//! 是因为每个测试用各自的 crash 目录，别的测试装的 hook 写不到自己这来。
-//! 新增测试务必沿用这个约定（每测试一个 tempdir），否则会出现随机失败。
+//! panic hook 是**进程级**的，本文件各测试共享同一个。而 `install` 是幂等的
+//! ——它**替换**上一个 hook，不是叠加。所以两个测试并行时，后装的会顶掉先装的：
+//! 先装的那个测试 panic 时，dump 就写进了另一个测试的目录，自己这边一个文件没有。
+//!
+//! 我起初以为「各用各的 tempdir 就互不干扰」，macOS 上也确实一直是绿的——
+//! 直到 CI 在 Windows 上翻车（线程调度不同，交错顺序就变了）。
+//! 那不是 Windows 的问题，是这些测试本来就有竞态，macOS 只是运气好。
+//!
+//! 故用一把锁把它们串起来：装 hook → panic → 检查，全程独占。
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use mj_tui::CrashDump;
+
+/// 序列化所有会碰 panic hook 的测试。
+static HOOK_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取得独占权。锁中毒无所谓——我们只关心互斥，不关心它守的那个 `()`。
+fn lock_hook() -> MutexGuard<'static, ()> {
+    HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 在子线程里触发 panic，验证 hook 把未保存正文写到了 crash 目录。
 ///
@@ -17,6 +32,7 @@ use mj_tui::CrashDump;
 /// 而 `catch_unwind` 能挡住测试进程被带崩。
 #[test]
 fn panic_dumps_unsaved_text_to_crash_dir() {
+    let _guard = lock_hook();
     let dir = tempfile::tempdir().unwrap();
     let crash_dir = dir.path().join("crash");
 
@@ -46,6 +62,7 @@ fn panic_dumps_unsaved_text_to_crash_dir() {
 /// 没有未保存内容时不应产生空文件——否则 crash 目录会被噪声塞满。
 #[test]
 fn panic_without_buffers_writes_nothing() {
+    let _guard = lock_hook();
     let dir = tempfile::tempdir().unwrap();
     let crash_dir = dir.path().join("crash");
 
@@ -63,6 +80,7 @@ fn panic_without_buffers_writes_nothing() {
 /// dump 多份文件。这里以「dump 文件恰好一份」作为不叠加的可观测证据。
 #[test]
 fn repeated_install_does_not_stack_hooks() {
+    let _guard = lock_hook();
     let dir = tempfile::tempdir().unwrap();
     let crash_dir = dir.path().join("crash");
 
