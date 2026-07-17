@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::batch::{BatchJob, BatchKind, BatchUndo, Scope};
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
+use crate::screens::character_panel::CharacterPanel;
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
@@ -75,6 +76,8 @@ struct Workspace {
     /// 最近一次校对的问题（整章坐标），供正文下划线着色（§6.8 [MUST]）。
     /// 关面板后仍留着，好让 Enter 跳过去时看得见；正文一改就清空——坐标失效了。
     proof_issues: Vec<mj_text::proof::Issue>,
+    /// 角色速查侧栏（Alt+C，§6.7）。同上，M6 并入浮层栈。
+    character: Option<CharacterPanel>,
 }
 
 impl Workspace {
@@ -347,6 +350,7 @@ impl App {
             confirm: None,
             proof: None,
             proof_issues: Vec::new(),
+            character: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -383,6 +387,9 @@ impl App {
         if matches!(&self.screen, Screen::Workspace(ws) if ws.proof.is_some()) {
             return self.on_key_proof(code);
         }
+        if matches!(&self.screen, Screen::Workspace(ws) if ws.character.is_some()) {
+            return self.on_key_character(code, mods);
+        }
         if matches!(&self.screen, Screen::Workspace(ws) if ws.stats.is_some()) {
             return self.on_key_stats(code);
         }
@@ -393,6 +400,10 @@ impl App {
             KeyCode::F(5) => return self.open_format_preview(),
             // F7 校对当前章（§6.8、§7.3）。
             KeyCode::F(7) => return self.open_proof(),
+            // Alt+C 角色速查侧栏（§6.7、§7.3）。
+            KeyCode::Char('c') if mods.contains(KeyModifiers::ALT) => {
+                return self.open_characters();
+            }
             // F8 历史面板（§7.3）。
             KeyCode::F(8) => return self.open_history(),
 
@@ -1252,6 +1263,110 @@ impl App {
         Ok(())
     }
 
+    // ---- 角色（§6.7）----
+
+    /// Alt+C：载入本书角色，弹速查侧栏。
+    fn open_characters(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        let chars = self.store.list_characters(book).unwrap_or_default();
+        let n = chars.len();
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.character = Some(CharacterPanel::new(chars));
+        }
+        if n == 0 {
+            self.toast = Some("还没有角色，按 n 新建".into());
+        }
+        Ok(())
+    }
+
+    fn on_key_character(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // 会写盘的动作先脱离对 ws 的借用。
+        match code {
+            KeyCode::Char('n') if !self.character_searching() => {
+                return self.new_character();
+            }
+            KeyCode::Char('d') if !self.character_searching() => {
+                return self.delete_character();
+            }
+            _ => {}
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = &mut ws.character else {
+            return Ok(());
+        };
+
+        // 搜索输入模式：字符进搜索框。
+        if p.is_searching() {
+            match code {
+                KeyCode::Esc | KeyCode::Enter => p.end_search(),
+                KeyCode::Backspace => p.backspace(),
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => p.input_char(c),
+                KeyCode::Down => p.move_down(),
+                KeyCode::Up => p.move_up(),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => ws.character = None,
+            KeyCode::Char('/') => p.start_search(),
+            KeyCode::Down | KeyCode::Char('j') => p.move_down(),
+            KeyCode::Up | KeyCode::Char('k') => p.move_up(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn character_searching(&self) -> bool {
+        matches!(&self.screen, Screen::Workspace(ws) if ws.character.as_ref().is_some_and(|p| p.is_searching()))
+    }
+
+    /// `n`：新建角色。沿用新建书的做法——先给占位名，之后再改（输入浮层属 M6）。
+    fn new_character(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        self.store.create_character(book, "新角色")?;
+        // 重新载入面板。
+        let chars = self.store.list_characters(book).unwrap_or_default();
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.character = Some(CharacterPanel::new(chars));
+        }
+        self.toast = Some("已新建「新角色」".into());
+        Ok(())
+    }
+
+    /// `d`：删除当前角色（移入 trash，§0 可撤销）。
+    fn delete_character(&mut self) -> anyhow::Result<()> {
+        let (book, id, name) = {
+            let Screen::Workspace(ws) = &self.screen else {
+                return Ok(());
+            };
+            let Some(p) = &ws.character else {
+                return Ok(());
+            };
+            match p.current() {
+                Some(c) => (ws.book.id, c.id, c.name.clone()),
+                None => return Ok(()),
+            }
+        };
+        self.store.delete_character(book, id)?;
+        let chars = self.store.list_characters(book).unwrap_or_default();
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.character = Some(CharacterPanel::new(chars));
+        }
+        self.toast = Some(format!("已删除「{name}」（在 trash 内，可找回）"));
+        Ok(())
+    }
+
     // ---- 校对（§6.8）----
 
     /// 忽略表，懒加载并缓存。
@@ -1978,6 +2093,28 @@ impl App {
         }
     }
 
+    /// 供测试：角色面板里筛选后的数量（None = 面板没开）。
+    #[doc(hidden)]
+    pub fn character_filtered_for_test(&self) -> Option<usize> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.character.as_ref().map(|p| p.filtered_count()),
+            _ => None,
+        }
+    }
+
+    /// 供测试：角色面板当前选中角色的名字。
+    #[doc(hidden)]
+    pub fn character_current_name_for_test(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws
+                .character
+                .as_ref()
+                .and_then(|p| p.current())
+                .map(|c| c.name.clone()),
+            _ => None,
+        }
+    }
+
     /// 供测试：把编辑焦点切到指定章（决定「当前章/当前卷」范围）。
     #[doc(hidden)]
     pub fn open_chapter_for_test(&mut self, ch: ChapterId) -> anyhow::Result<()> {
@@ -2115,6 +2252,8 @@ impl App {
                     render_format_preview(frame, body, p);
                 } else if let Some(p) = &mut ws.proof {
                     render_proof(frame, body, p);
+                } else if let Some(p) = &mut ws.character {
+                    render_characters(frame, body, p);
                 } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
                     render_stats(frame, body, st, &rows, &ws.book.title);
                 } else {
@@ -2143,6 +2282,16 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.character.is_some() => {
+                    let searching = ws.character.as_ref().is_some_and(|p| p.is_searching());
+                    if searching {
+                        spans.push(Span::raw(" 搜索角色 │ 输入筛选 │ Enter/Esc 结束搜索 "));
+                    } else {
+                        spans.push(Span::raw(
+                            " 角色 │ j/k 移动 │ / 搜索 │ n 新建 │ d 删除 │ Esc 关闭 ",
+                        ));
+                    }
                 }
                 Screen::Workspace(ws) if ws.proof.is_some() => {
                     spans.push(Span::raw(
@@ -2914,6 +3063,75 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     // 光标只在编辑器有焦点时显示。
     if focused && let Some((col, row)) = open.viewport.cursor_screen_pos(&open.buffer) {
         frame.set_cursor_position((inner.x + col, inner.y + row));
+    }
+}
+
+/// 角色速查侧栏 / 列表页（Alt+C，§6.7）。宽屏左列表右详情，窄屏只列表。
+fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPanel) {
+    let title = if p.is_searching() {
+        format!(" 角色 · 搜索：{}▏", p.query())
+    } else {
+        format!(" 角色 · {} 位 ", p.total())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if p.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from("还没有角色。").centered(),
+                Line::from("按 n 新建。").centered(),
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    // 宽度够就分栏：左列表、右详情。
+    let (list_area, detail_area) = if inner.width >= 60 {
+        let [l, r] = Layout::horizontal([Constraint::Length(28), Constraint::Min(0)]).areas(inner);
+        (l, Some(r))
+    } else {
+        (inner, None)
+    };
+
+    p.set_height(list_area.height as usize);
+    let filtered = p.filtered();
+    let list: Vec<Line> = filtered
+        .iter()
+        .enumerate()
+        .skip(p.scroll())
+        .take(list_area.height as usize)
+        .map(|(i, c)| {
+            let mut style = Style::default();
+            if i == p.cursor() {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            Line::styled(CharacterPanel::summary_line(c), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(list), list_area);
+
+    if let Some(da) = detail_area {
+        // 竖分隔线用左边框近似。
+        let dblock = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let dinner = dblock.inner(da);
+        frame.render_widget(dblock, da);
+        if let Some(c) = p.current() {
+            let lines: Vec<Line> = CharacterPanel::detail_lines(c)
+                .into_iter()
+                .take(dinner.height as usize)
+                .map(Line::from)
+                .collect();
+            frame.render_widget(Paragraph::new(lines), dinner);
+        }
     }
 }
 
