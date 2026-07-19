@@ -136,12 +136,34 @@ pub struct App {
     theme: Theme,
     /// 专注模式（F11，§7.3）：收起目录树、按 focus_column_width 收窄正文。
     focus_mode: bool,
+    /// 键位表（§7.3 [MUST] 可重绑定）。启动时由 config 的 [keymap] 构建。
+    keymap: crate::keymap::Keymap,
 }
 
 impl App {
     pub fn new(store: Store, config: Config) -> anyhow::Result<Self> {
         let books = store.list_books()?;
         let theme = Self::resolve_theme(&store, &config);
+
+        // 键位表：冲突要报警（§7.3 [MUST]）。这里只记日志——起窗之后不能往
+        // stdout 打字（§0 禁令 2），提示改由状态栏 toast 给。
+        let (keymap, problems) = crate::keymap::Keymap::from_config(&config.keymap);
+        for p in &problems {
+            tracing::warn!("{}", p.message());
+        }
+        // 首屏给一条提示：光写日志等于没报警——用户不会去翻日志，
+        // 只会觉得「我配的键位怎么不管用」。
+        let toast = problems.first().map(|p| {
+            if problems.len() > 1 {
+                format!(
+                    "{}（另有 {} 处键位问题，详见日志）",
+                    p.message(),
+                    problems.len() - 1
+                )
+            } else {
+                p.message()
+            }
+        });
 
         Ok(Self {
             store,
@@ -151,13 +173,14 @@ impl App {
             screen: Screen::Shelf(Shelf::new(books)),
             should_quit: false,
             dirty: true,
-            toast: None,
+            toast,
             today_words: 0,
             last_snapshot: None,
             batch_undo: None,
             ignore: None,
             theme,
             focus_mode: false,
+            keymap,
         })
     }
 
@@ -410,92 +433,42 @@ impl App {
             };
         }
 
-        // 先处理全局键。
-        match code {
-            // Ctrl+P 命令面板（§7.3「最重要的一条」）。
-            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
-                if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.modals.push(Modal::Palette(Box::default()));
-                }
-                return Ok(());
+        // Ctrl+P 命令面板：**先于键位表**判，且不进键位表。
+        //
+        // 它是通往所有命令的入口。若允许被重绑覆盖，用户一旦把别的命令绑到 Ctrl+P，
+        // 就再也没有地方能找回其余命令了——那是个自锁。故这一个键留死。
+        if code == KeyCode::Char('p') && mods.contains(KeyModifiers::CONTROL) {
+            if let Screen::Workspace(ws) = &mut self.screen {
+                ws.modals.push(Modal::Palette(Box::default()));
             }
-            // F2 外观设置（§6.10）。
-            KeyCode::F(2) => return self.run_command(Command::Appearance),
-            // F11 专注模式（§7.3）。
-            KeyCode::F(11) => return self.run_command(Command::FocusMode),
-            // F1 帮助（键位总表，§7.3）。
-            KeyCode::F(1) => {
-                if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.modals.push(Modal::Help(Box::default()));
-                }
-                return Ok(());
-            }
-            // F5 一键排版（当前章，弹预览）——§7.3 键位表。
-            KeyCode::F(5) => return self.open_format_preview(),
-            // F7 校对当前章（§6.8、§7.3）。
-            KeyCode::F(7) => return self.open_proof(),
-            // Alt+C 角色速查侧栏（§6.7、§7.3）。
-            KeyCode::Char('c') if mods.contains(KeyModifiers::ALT) => {
-                return self.open_characters();
-            }
-            // F8 历史面板（§7.3）。
-            KeyCode::F(8) => return self.open_history(),
+            return Ok(());
+        }
 
-            // 手动打快照。
-            //
-            // §7.3 指定的是 Ctrl+Shift+S，但**在传统键盘模式下它根本到不了**：
-            // 终端对 Ctrl+S 与 Ctrl+Shift+S 发的是同一个字节（0x13），Shift 压根没编码进去。
-            // 要区分得开 kitty 键盘协议（§2.3：可选，需运行时探测），那是 M6 的活。
-            //
-            // 一个永远不触发的键位比没有更糟——用户会以为功能坏了。
-            // 故 F9 作为当下真正可用的入口；Ctrl+Shift+S 的分支留着，
-            // M6 开了协议它自然就活了。
-            KeyCode::F(9) => return self.manual_snapshot(),
-            KeyCode::Char('S') if mods.contains(KeyModifiers::CONTROL) => {
-                return self.manual_snapshot();
+        // 其余全局键一律走键位表（§7.3 [MUST] 可重绑定）。
+        //
+        // 从前这里是一长串写死的 `KeyCode::F(7) => ...`，那样键位就绑死在代码里，
+        // `[keymap]` 配了也不生效。现在按键先查表拿到命令，再交给 run_command——
+        // 于是「命令表 → 键位表 → 执行」是一条链，帮助页上写的键就是真按得出效果的键。
+        if let Some(cmd) = self.keymap.lookup(code, mods) {
+            return self.run_command(cmd);
+        }
+
+        // Ctrl+Shift+S 打快照：§7.3 指定的键，但**传统键盘模式下根本到不了**
+        // （终端对 Ctrl+S 与 Ctrl+Shift+S 发同一个字节，Shift 没编码进去）。
+        // 留着这条分支，开了 kitty 键盘协议它自然就活；实际入口是 F9。
+        if code == KeyCode::Char('S') && mods.contains(KeyModifiers::CONTROL) {
+            return self.manual_snapshot();
+        }
+
+        // Tab 切焦点：上下文键，不占命令表。
+        if code == KeyCode::Tab {
+            if let Screen::Workspace(ws) = &mut self.screen {
+                ws.focus = match ws.focus {
+                    Focus::Tree => Focus::Editor,
+                    Focus::Editor => Focus::Tree,
+                };
             }
-            // Ctrl+F 查找 / Ctrl+H 查找替换（§7.3）。
-            KeyCode::Char('f') if mods.contains(KeyModifiers::CONTROL) => {
-                return self.open_search(false);
-            }
-            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
-                return self.open_search(true);
-            }
-            // F3 打开统计面板（§6.4 [MUST]）。
-            // §7.3 的键位表没给它分配键——F5/F7/F8 已被排版/校对/历史占用，
-            // F3 空着且相邻，故取之。M6 做命令面板时会有正式入口。
-            KeyCode::F(3) => {
-                if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.modals.push(Modal::Stats(Box::new(Stats::new())));
-                }
-                return Ok(());
-            }
-            KeyCode::Char('b') if mods.contains(KeyModifiers::CONTROL) => {
-                if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.show_tree = !ws.show_tree;
-                    if !ws.show_tree {
-                        ws.focus = Focus::Editor;
-                    }
-                }
-                return Ok(());
-            }
-            KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
-                return self.save_current();
-            }
-            // Alt+U：撤销刚做完的那次批量作业（§6.6 [MUST]）。
-            KeyCode::Char('u') if mods.contains(KeyModifiers::ALT) => {
-                return self.undo_batch();
-            }
-            KeyCode::Tab => {
-                if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.focus = match ws.focus {
-                        Focus::Tree => Focus::Editor,
-                        Focus::Editor => Focus::Tree,
-                    };
-                }
-                return Ok(());
-            }
-            _ => {}
+            return Ok(());
         }
 
         let focus = match &self.screen {
@@ -2924,6 +2897,7 @@ impl App {
         // 配色与版面参数：与 screen 是不同字段，可与下面的可变借用并存。
         let theme = &self.theme;
         let layout = EditorLayout::from_config(&self.config, self.focus_mode);
+        let keymap = &self.keymap;
 
         // 先铺一层主题底色——sepia 这类预设的观感八成来自它（§2.1「二级降级」）。
         // 兜底主题的 bg 是 Reset，铺上去等同不铺，对 8 色终端无害。
@@ -2962,7 +2936,7 @@ impl App {
                         Modal::Characters(p) => render_characters(frame, body, p, theme),
                         Modal::Confirm(c) => render_confirm(frame, body, c, theme),
                         Modal::Palette(p) => render_palette(frame, body, p, theme),
-                        Modal::Help(h) => render_help(frame, body, h, theme),
+                        Modal::Help(h) => render_help(frame, body, h, theme, keymap),
                         Modal::Settings(s) => render_settings(frame, body, s, theme),
                         Modal::Stats(st) => {
                             if let Some(rows) = &stats_rows {
@@ -4164,7 +4138,13 @@ fn render_settings(frame: &mut ratatui::Frame, area: Rect, s: &mut Settings, the
 }
 
 /// 帮助页（F1，§7.3）：键位总表，内容由命令表生成。
-fn render_help(frame: &mut ratatui::Frame, area: Rect, h: &mut Help, theme: &Theme) {
+fn render_help(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    h: &mut Help,
+    theme: &Theme,
+    keymap: &crate::keymap::Keymap,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 帮助 · 键位总表（j/k 滚动，Esc 关闭） ")
@@ -4173,7 +4153,7 @@ fn render_help(frame: &mut ratatui::Frame, area: Rect, h: &mut Help, theme: &The
     frame.render_widget(block, area);
 
     h.set_height(inner.height as usize);
-    let rows = Help::rows();
+    let rows = Help::rows_with(keymap);
     let lines: Vec<Line> = rows
         .iter()
         .skip(h.scroll())

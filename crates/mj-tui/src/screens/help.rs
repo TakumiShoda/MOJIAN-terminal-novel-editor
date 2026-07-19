@@ -90,8 +90,20 @@ impl Help {
         self.scroll = self.scroll.min(max);
     }
 
-    /// 整页内容。按命令表分类生成，再附上通用键与面板内专属键。
+    /// 整页内容，键位取自**当前生效的键位表**。
+    ///
+    /// 不能直接印命令表里的默认键：用户在 `[keymap]` 重绑过之后，
+    /// 帮助页若还印默认值，就成了一张骗人的表。
+    pub fn rows_with(keymap: &crate::keymap::Keymap) -> Vec<HelpRow> {
+        Self::build(Some(keymap))
+    }
+
+    /// 整页内容（用命令表里的默认键位）。
     pub fn rows() -> Vec<HelpRow> {
+        Self::build(None)
+    }
+
+    fn build(keymap: Option<&crate::keymap::Keymap>) -> Vec<HelpRow> {
         let mut out = Vec::new();
 
         out.push(HelpRow::Section("通用".into()));
@@ -110,13 +122,15 @@ impl Help {
             out.push(HelpRow::Blank);
             out.push(HelpRow::Section(cat.label().to_string()));
             for c in items {
+                // 当前实际绑定优先；没有键位的明说走命令面板，别留空让人猜。
+                let keys = match keymap.and_then(|k| k.binding_of(c.cmd)) {
+                    Some(b) => b.display(),
+                    None if keymap.is_some() => "（Ctrl+P）".to_string(),
+                    None if c.keys.is_empty() => "（Ctrl+P）".to_string(),
+                    None => c.keys.to_string(),
+                };
                 out.push(HelpRow::Entry {
-                    // 没有专属键位的，明说走命令面板，别留空让人猜。
-                    keys: if c.keys.is_empty() {
-                        "（Ctrl+P）".to_string()
-                    } else {
-                        c.keys.to_string()
-                    },
+                    keys,
                     what: format!("{} —— {}", c.name, c.desc),
                 });
             }

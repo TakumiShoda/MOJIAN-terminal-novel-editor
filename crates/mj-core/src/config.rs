@@ -31,6 +31,12 @@ pub struct Config {
     /// 校对规则开关与阈值（§6.8、§8 `[proof]`）。
     #[serde(default)]
     pub proof: Proof,
+    /// 键位重绑定（§7.3 `[MUST]`）：命令 id → 键位串，如 `proof = "F6"`。
+    ///
+    /// 存原始 table 而非强类型：键位的解析与冲突检测要用 ratatui 的按键类型，
+    /// 那属 mj-tui（§4 分层，mj-core 不依赖 ratatui）。
+    #[serde(default)]
+    pub keymap: toml::Table,
 
     /// 未知的顶层表，原样透传（doc.md §8 前向兼容）。
     #[serde(flatten)]

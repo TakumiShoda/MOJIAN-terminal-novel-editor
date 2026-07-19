@@ -37,6 +37,48 @@ pub enum Command {
     Help,
 }
 
+impl Command {
+    /// 稳定标识，用作 `[keymap]` 里的配置键。
+    ///
+    /// **不要改这些字符串**——改一个，用户配置里对应的重绑定就悄悄失效了。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Save => "save",
+            Self::Snapshot => "snapshot",
+            Self::NewChapter => "new_chapter",
+            Self::BackToShelf => "back_to_shelf",
+            Self::Quit => "quit",
+            Self::Undo => "undo",
+            Self::Redo => "redo",
+            Self::Find => "find",
+            Self::Replace => "replace",
+            Self::Format => "format",
+            Self::UndoBatch => "undo_batch",
+            Self::Proof => "proof",
+            Self::History => "history",
+            Self::Characters => "characters",
+            Self::Stats => "stats",
+            Self::ToggleTree => "toggle_tree",
+            Self::Appearance => "appearance",
+            Self::FocusMode => "focus_mode",
+            Self::Help => "help",
+        }
+    }
+
+    /// 是否占用一个**全局**键位（可被 `[keymap]` 重绑定）。
+    ///
+    /// `Esc` 那种上下文相关的键不算：它在浮层里是「关掉这层」、在正文里是
+    /// 「取消选区」、在树里才是「回书架」。登记成全局键会把前两者吃掉。
+    pub fn has_global_key(self) -> bool {
+        !matches!(self, Self::BackToShelf)
+    }
+
+    /// 按 id 找命令。
+    pub fn from_id(id: &str) -> Option<Self> {
+        COMMANDS.iter().map(|c| c.cmd).find(|c| c.id() == id)
+    }
+}
+
 /// 命令分类，帮助页按此分组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
