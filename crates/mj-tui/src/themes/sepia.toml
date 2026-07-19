@@ -1,0 +1,18 @@
+# 内置主题：护眼米黄（默认）。长时间码字用，对比度压低但不糊。
+# 见 doc.md §6.10、§8 的 [appearance] theme = "sepia"。
+name = "sepia"
+
+bg           = "#f4ecd8"
+fg           = "#3b3228"
+dim          = "#8a7c68"
+accent       = "#8a5a2b"
+border       = "#d8cbb0"
+selection_bg = "#e0d0a8"
+selection_fg = "#2a231a"
+error        = "#a33028"
+warning      = "#8a6a1a"
+hint         = "#8a7c68"
+insert       = "#4a7a3a"
+delete       = "#a33028"
+status_bg    = "#e8dcc0"
+status_fg    = "#3b3228"

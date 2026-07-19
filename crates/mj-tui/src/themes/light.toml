@@ -1,0 +1,17 @@
+# 内置主题：亮色。见 doc.md §6.10。
+name = "light"
+
+bg           = "#ffffff"
+fg           = "#1f1f1f"
+dim          = "#8a8a8a"
+accent       = "#0f7b6c"
+border       = "#d0d0d0"
+selection_bg = "#cce5ff"
+selection_fg = "#1f1f1f"
+error        = "#c72e2e"
+warning       = "#9a6700"
+hint         = "#8a8a8a"
+insert       = "#1a7f37"
+delete       = "#c72e2e"
+status_bg    = "#f3f3f3"
+status_fg    = "#333333"

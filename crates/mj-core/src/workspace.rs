@@ -64,6 +64,50 @@ impl Workspace {
         self.dict_dir().join("ignore.json")
     }
 
+    /// 用户自建主题目录（§6.10：主题定义为 TOML，放 themes/*.toml）。
+    pub fn themes_dir(&self) -> PathBuf {
+        self.root.join("themes")
+    }
+
+    pub fn theme_file(&self, name: &str) -> PathBuf {
+        self.themes_dir().join(format!("{name}.toml"))
+    }
+
+    /// 读用户主题的 TOML 文本。不存在返回 None（用内置同名主题）。
+    ///
+    /// 只回文本、不解析：颜色是 ratatui 的类型，按 §4 分层归 mj-tui，
+    /// 本 crate 不认得也不该认得。
+    pub fn read_theme(&self, name: &str) -> Option<String> {
+        let path = self.theme_file(name);
+        match std::fs::read_to_string(&path) {
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "读主题文件失败，用内置主题");
+                None
+            }
+        }
+    }
+
+    /// 列出用户自建的主题名（不含内置）。
+    pub fn list_user_themes(&self) -> Vec<String> {
+        let dir = self.themes_dir();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().and_then(|x| x.to_str()) == Some("toml"))
+                    .then(|| p.file_stem()?.to_str().map(|s| s.to_string()))
+                    .flatten()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -99,6 +143,7 @@ impl Workspace {
             self.logs_dir(),
             self.books_dir(),
             self.crash_dir(),
+            self.themes_dir(),
         ] {
             std::fs::create_dir_all(&dir).map_err(|source| Error::Io { path: dir, source })?;
         }

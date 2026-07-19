@@ -1,0 +1,19 @@
+# 内置主题：暗色。见 doc.md §6.10。
+# 复制本文件到 <workspace>/themes/<你的名字>.toml 即可自建主题；
+# 只写想改的槽位，其余自动继承内置主题。
+name = "dark"
+
+bg           = "#1c1c1c"
+fg           = "#d4d4d4"
+dim          = "#6b6b6b"   # 次要文字：提示、未聚焦
+accent       = "#4ec9b0"   # 焦点边框、强调
+border       = "#3a3a3a"
+selection_bg = "#264f78"
+selection_fg = "#ffffff"
+error        = "#f14c4c"
+warning      = "#cca700"
+hint         = "#6b6b6b"
+insert       = "#4ec94e"   # diff 增行
+delete       = "#f14c4c"   # diff 删行
+status_bg    = "#252526"
+status_fg    = "#c8c8c8"

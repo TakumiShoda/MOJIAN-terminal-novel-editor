@@ -1,0 +1,17 @@
+# 内置主题：高对比。弱视/强光环境用，全部走纯色端点。
+name = "high_contrast"
+
+bg           = "#000000"
+fg           = "#ffffff"
+dim          = "#c0c0c0"
+accent       = "#00ffff"
+border       = "#ffffff"
+selection_bg = "#ffffff"
+selection_fg = "#000000"
+error        = "#ff0000"
+warning      = "#ffff00"
+hint         = "#c0c0c0"
+insert       = "#00ff00"
+delete       = "#ff0000"
+status_bg    = "#000000"
+status_fg    = "#ffffff"

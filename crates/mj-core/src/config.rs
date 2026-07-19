@@ -195,6 +195,12 @@ pub struct Appearance {
     pub column_width: u16,
     pub font_family: String,
     pub font_size: f32,
+    /// 段间额外空行（§6.10）。
+    pub paragraph_spacing: u16,
+    /// 正文左右留白列数（§6.10）。
+    pub margin: u16,
+    /// 是否显示行号（§6.10）。
+    pub line_number: bool,
     #[serde(flatten)]
     pub extra: toml::Table,
 }
@@ -206,6 +212,9 @@ impl Default for Appearance {
             column_width: 40,
             font_family: "Source Han Serif".into(),
             font_size: 14.0,
+            paragraph_spacing: 0,
+            margin: 4,
+            line_number: false,
             extra: toml::Table::new(),
         }
     }

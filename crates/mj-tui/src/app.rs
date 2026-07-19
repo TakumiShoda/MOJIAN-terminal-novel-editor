@@ -31,6 +31,7 @@ use crate::screens::search_panel::{self, SearchPanel};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
 use crate::screens::tree::{Row, Tree};
+use crate::theme::{ColorDepth, Theme};
 
 /// §7.2：目录树宽度默认 24 列。
 const TREE_WIDTH: u16 = 24;
@@ -140,11 +141,14 @@ pub struct App {
     batch_undo: Option<BatchUndo>,
     /// 已忽略的校对问题（§6.8）。懒加载：首次 F7 时从 dict/ignore.json 读。
     ignore: Option<mj_core::proofing::IgnoreSet>,
+    /// 当前配色（§6.10）。启动时按 config.appearance.theme + 终端色深解析。
+    theme: Theme,
 }
 
 impl App {
     pub fn new(store: Store, config: Config) -> anyhow::Result<Self> {
         let books = store.list_books()?;
+        let theme = Self::resolve_theme(&store, &config);
 
         Ok(Self {
             store,
@@ -159,7 +163,26 @@ impl App {
             last_snapshot: None,
             batch_undo: None,
             ignore: None,
+            theme,
         })
+    }
+
+    /// 解析当前配色（§6.10）。
+    ///
+    /// 用户 `themes/<name>.toml` 优先于同名内置主题——这样用户能覆盖内置的
+    /// sepia 而不必另起名字。色深按终端探测，仅 256 色时主题自动降级取近似。
+    fn resolve_theme(store: &Store, config: &Config) -> Theme {
+        let depth = ColorDepth::detect();
+        let name = &config.appearance.theme;
+        match store.workspace().read_theme(name) {
+            Some(text) => Theme::from_toml(&text, depth, "sepia"),
+            None => Theme::load_builtin(name, depth),
+        }
+    }
+
+    /// 当前配色，供渲染。
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     /// 打开某书的索引。
@@ -2517,29 +2540,39 @@ impl App {
             _ => None,
         };
 
+        // 配色与 screen 是不同字段，可与下面的可变借用并存。
+        let theme = &self.theme;
+
+        // 先铺一层主题底色——sepia 这类预设的观感八成来自它（§2.1「二级降级」）。
+        // 兜底主题的 bg 是 Reset，铺上去等同不铺，对 8 色终端无害。
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme.bg).fg(theme.fg)),
+            area,
+        );
+
         match &mut self.screen {
-            Screen::Shelf(shelf) => render_shelf(frame, body, shelf),
+            Screen::Shelf(shelf) => render_shelf(frame, body, shelf, theme),
             Screen::Workspace(ws) => {
                 if let Some(job) = &ws.batch {
-                    render_batch(frame, body, job);
+                    render_batch(frame, body, job, theme);
                 } else if let Some(v) = &mut ws.diff {
-                    render_diff(frame, body, v);
+                    render_diff(frame, body, v, theme);
                 } else if let Some(p) = &mut ws.history {
-                    render_history(frame, body, p);
+                    render_history(frame, body, p, theme);
                 } else if let Some(p) = &mut ws.search {
-                    render_search(frame, body, p);
+                    render_search(frame, body, p, theme);
                 } else if let Some(p) = &mut ws.format_preview {
-                    render_format_preview(frame, body, p);
+                    render_format_preview(frame, body, p, theme);
                 } else if let Some(p) = &mut ws.proof {
-                    render_proof(frame, body, p);
+                    render_proof(frame, body, p, theme);
                 } else if let Some(fm) = &mut ws.character_form {
-                    render_character_form(frame, body, fm);
+                    render_character_form(frame, body, fm, theme);
                 } else if let Some(p) = &mut ws.character {
-                    render_characters(frame, body, p);
+                    render_characters(frame, body, p, theme);
                 } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
-                    render_stats(frame, body, st, &rows, &ws.book.title);
+                    render_stats(frame, body, st, &rows, &ws.book.title, theme);
                 } else {
-                    render_workspace(frame, body, ws);
+                    render_workspace(frame, body, ws, theme);
                 }
             }
         }
@@ -2548,13 +2581,14 @@ impl App {
         if let Screen::Workspace(ws) = &self.screen
             && let Some(c) = &ws.confirm
         {
-            render_confirm(frame, body, c);
+            render_confirm(frame, body, c, theme);
         }
 
         self.render_status(frame, status);
     }
 
     fn render_status(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let theme = &self.theme;
         let mut spans: Vec<Span> = Vec::new();
 
         if let Some(t) = &self.toast {
@@ -2599,7 +2633,7 @@ impl App {
                         } else {
                             format!("│ f 展开 {n} 条低置信 ")
                         };
-                        spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(label, Style::default().fg(theme.dim)));
                     }
                     spans.push(Span::raw("│ Esc 关闭 "));
                 }
@@ -2649,7 +2683,7 @@ impl App {
                         let n = mj_text::count::count_with_punct(&sel);
                         spans.push(Span::styled(
                             format!(" 选中 {} 字 ", format_words(n as u64)),
-                            Style::default().fg(Color::Cyan),
+                            Style::default().fg(theme.accent),
                         ));
                         spans.push(Span::raw("│ Esc 取消选择 "));
                         frame.render_widget(
@@ -2690,16 +2724,16 @@ impl App {
                     spans.push(Span::styled(
                         format!("今日 {sign}{} ", self.today_words),
                         Style::default().fg(if self.today_words >= 0 {
-                            Color::Green
+                            theme.insert
                         } else {
-                            Color::DarkGray
+                            theme.dim
                         }),
                     ));
 
                     if let Some(open) = &ws.editor {
                         spans.push(Span::raw("│ "));
                         if open.buffer.is_dirty() {
-                            spans.push(Span::styled("●未保存", Style::default().fg(Color::Yellow)));
+                            spans.push(Span::styled("●未保存", Style::default().fg(theme.warning)));
                         } else {
                             spans.push(Span::raw("已保存"));
                         }
@@ -2714,7 +2748,7 @@ impl App {
                     if let Some(u) = &self.batch_undo {
                         spans.push(Span::styled(
                             format!("│ Alt+U {} ", u.describe()),
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(theme.warning),
                         ));
                     }
 
@@ -2722,7 +2756,7 @@ impl App {
                     if frame.area().width < NARROW_THRESHOLD {
                         spans.push(Span::styled(
                             "│ 窄屏：侧栏已隐藏",
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme.dim),
                         ));
                     }
                 }
@@ -2736,10 +2770,11 @@ impl App {
     }
 }
 
-fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf) {
+fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 墨简 · 书架 ");
+        .title(" 墨简 · 书架 ")
+        .border_style(Style::default().fg(theme.border));
 
     if shelf.is_empty() {
         frame.render_widget(
@@ -2771,9 +2806,11 @@ fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf) {
             line.push_str(&format!("  {:.0}%", p * 100.0));
         }
         let style = if i == shelf.cursor() {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
             Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg)
         };
         lines.push(Line::styled(line, style));
     }
@@ -2781,7 +2818,7 @@ fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
+fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, theme: &Theme) {
     // §7.2：窄屏（< 80 列）自动隐藏侧栏，只留正文。
     let narrow = area.width < NARROW_THRESHOLD;
     let show_tree = ws.show_tree && !narrow;
@@ -2795,13 +2832,13 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) 
     };
 
     if let Some(ta) = tree_area {
-        render_tree(frame, ta, ws);
+        render_tree(frame, ta, ws, theme);
     }
-    render_editor(frame, editor_area, ws);
+    render_editor(frame, editor_area, ws, theme);
 }
 
 /// 历史面板（§6.9）。
-fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel) {
+fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel, theme: &Theme) {
     let title = match p.compare_target() {
         Some(_) => " 历史 · 已选对照条，Enter 两条互比 ".to_string(),
         None => format!(" 历史 · {} 条快照 ", p.snapshots().len()),
@@ -2809,7 +2846,7 @@ fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel) 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2821,7 +2858,7 @@ fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel) 
             let mut style = Style::default();
             if p.snapshots()[i].is_protected() {
                 // 受保护的醒目一点——它们是用户特意留下的锚点。
-                style = style.fg(Color::Yellow);
+                style = style.fg(theme.warning);
             }
             if i == p.cursor() {
                 style = style.add_modifier(Modifier::REVERSED);
@@ -2834,7 +2871,7 @@ fn render_history(frame: &mut ratatui::Frame, area: Rect, p: &mut HistoryPanel) 
 }
 
 /// diff 界面（§6.9、§12.4 的线框）。
-fn render_diff(frame: &mut ratatui::Frame, area: Rect, v: &mut DiffView) {
+fn render_diff(frame: &mut ratatui::Frame, area: Rect, v: &mut DiffView, theme: &Theme) {
     // §12.4：标题栏是「与「…」比较 ─── +312 / -87 / 3 处改动」。
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2843,7 +2880,7 @@ fn render_diff(frame: &mut ratatui::Frame, area: Rect, v: &mut DiffView) {
             v.old_title,
             v.summary_line()
         ))
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2864,9 +2901,9 @@ fn render_diff(frame: &mut ratatui::Frame, area: Rect, v: &mut DiffView) {
             let current = dl.hunk == Some(v.hunk_cursor());
             let (marker, style) = match dl.kind {
                 // §6.9：增行绿底、删行红底。
-                LineKind::Insert => ("+", Style::default().fg(Color::Green)),
-                LineKind::Delete => ("-", Style::default().fg(Color::Red)),
-                LineKind::Equal => (" ", Style::default().fg(Color::DarkGray)),
+                LineKind::Insert => ("+", Style::default().fg(theme.insert)),
+                LineKind::Delete => ("-", Style::default().fg(theme.error)),
+                LineKind::Equal => (" ", Style::default().fg(theme.dim)),
             };
             // 当前块加粗——n/p 跳过来之后要看得出跳到哪了。
             let style = if current {
@@ -2891,7 +2928,7 @@ fn snapshot_title(s: &mj_core::history::Snapshot) -> String {
 }
 
 /// 查找替换面板（§6.6）。
-fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
+fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel, theme: &Theme) {
     let title = if p.replace_mode {
         " 查找替换 · 当前章 "
     } else {
@@ -2900,7 +2937,7 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2919,26 +2956,28 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
         "查找",
         &p.query,
         p.field() == search_panel::Field::Query,
+        theme,
     ))];
     if p.replace_mode {
         input_lines.push(Line::from(field_line(
             "替换",
             &p.replace_with,
             p.field() == search_panel::Field::Replace,
+            theme,
         )));
     }
     frame.render_widget(Paragraph::new(input_lines), inputs);
 
     frame.render_widget(
-        Paragraph::new(p.options_line()).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(p.options_line()).style(Style::default().fg(theme.dim)),
         options,
     );
 
     // 摘要：命中数，或非法正则的实时提示（§6.6 [MUST]）。
     let summary_style = if p.error().is_some() {
-        Style::default().fg(Color::Red)
+        Style::default().fg(theme.error)
     } else {
-        Style::default().fg(Color::Green)
+        Style::default().fg(theme.insert)
     };
     frame.render_widget(Paragraph::new(p.summary()).style(summary_style), summary);
 
@@ -2968,7 +3007,7 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
                 Span::styled(before.to_string(), base),
                 Span::styled(
                     hit.to_string(),
-                    base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    base.fg(theme.warning).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(after.to_string(), base),
             ])
@@ -2979,12 +3018,12 @@ fn render_search(frame: &mut ratatui::Frame, area: Rect, p: &mut SearchPanel) {
 }
 
 /// 一行输入框。有焦点的那行用 ▸ 与下划线标出。
-fn field_line(label: &str, value: &str, focused: bool) -> Vec<Span<'static>> {
+fn field_line(label: &str, value: &str, focused: bool, theme: &Theme) -> Vec<Span<'static>> {
     let marker = if focused { "▸" } else { " " };
     let style = if focused {
         Style::default().add_modifier(Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.dim)
     };
     vec![
         Span::raw(format!("{marker} {label}: ")),
@@ -2996,7 +3035,7 @@ fn field_line(label: &str, value: &str, focused: bool) -> Vec<Span<'static>> {
 
 /// 排版预览（§6.5 [MUST]：显示将改动的位置与条数，可逐条取消）。
 /// 校对面板（F7，§6.8）。按严重度分组，逐条列出，命中原文加下划线着色。
-fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
+fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel, theme: &Theme) {
     use proof_panel::Row;
 
     let title = if p.is_empty() {
@@ -3007,7 +3046,7 @@ fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3027,7 +3066,7 @@ fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
     // 每条问题占一行；分组表头也占一行，但不参与滚动窗口（近似：表头很少，
     // 直接连问题一起画，靠 scroll 起点对齐问题序号）。
     let rows = p.rows();
-    let sev_color = proof_severity_color;
+    let sev_color = |s| proof_severity_color(s, theme);
 
     let mut lines: Vec<Line> = Vec::new();
     for row in &rows {
@@ -3060,7 +3099,7 @@ fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
                 lines.push(Line::from(vec![
                     Span::styled(format!("[{cat}] "), base),
                     Span::styled(issue.message.clone(), base),
-                    Span::styled(sug, Style::default().fg(Color::Green)),
+                    Span::styled(sug, Style::default().fg(theme.insert)),
                 ]));
             }
         }
@@ -3077,7 +3116,12 @@ fn render_proof(frame: &mut ratatui::Frame, area: Rect, p: &mut ProofPanel) {
     frame.render_widget(Paragraph::new(view), inner);
 }
 
-fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatPreview) {
+fn render_format_preview(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    p: &mut FormatPreview,
+    theme: &Theme,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
@@ -3085,7 +3129,7 @@ fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatP
             p.len(),
             p.included_count()
         ))
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme.warning));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3104,7 +3148,7 @@ fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatP
                 Style::default()
             } else {
                 // 取消掉的条目压暗——一眼看出它不会被应用。
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.dim)
             };
             if i == p.cursor() {
                 style = style.add_modifier(Modifier::REVERSED);
@@ -3118,11 +3162,11 @@ fn render_format_preview(frame: &mut ratatui::Frame, area: Rect, p: &mut FormatP
 
 /// 统计面板（§6.4 [MUST]：按卷/章列出双口径字数，可导出 CSV）。
 /// 批量作业进行中：进度条 + 中断提示（§6.5 `[MUST]`）。
-fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob) {
+fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {}中… ", job.kind.label()))
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3133,19 +3177,19 @@ fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob) {
         Line::raw(""),
         Line::from(Span::styled(
             job.progress_line(bar_width),
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(theme.accent),
         )),
         Line::raw(""),
         Line::from(Span::styled(
             "Esc 中断（已完成的章保留）",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 宽范围作业的确认框。居中浮层，盖在底下那层上。
-fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm) {
+fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm, theme: &Theme) {
     let lines = c.lines();
     // 宽度按最长一行算（CJK 占两格），高度按行数——内容多大就多大，
     // 不让「全书 200 章」这种关键数字被截掉。
@@ -3170,7 +3214,7 @@ fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", c.title()))
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(theme.warning));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -3182,10 +3226,10 @@ fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm) {
 
     // 选中的那个反白。默认停在「取消」。
     let sel = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
+        .fg(theme.selection_fg)
+        .bg(theme.warning)
         .add_modifier(Modifier::BOLD);
-    let plain = Style::default().fg(Color::DarkGray);
+    let plain = Style::default().fg(theme.dim);
     let btns = Line::from(vec![
         Span::styled("  取消 (Esc)  ", if c.is_yes() { plain } else { sel }),
         Span::raw("   "),
@@ -3203,11 +3247,12 @@ fn render_stats(
     stats: &Stats,
     rows: &[stats::StatRow],
     book_title: &str,
+    theme: &Theme,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" 统计 · 《{book_title}》 "))
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3223,7 +3268,7 @@ fn render_stats(
             let style = match r {
                 stats::StatRow::Volume { .. } => Style::default().add_modifier(Modifier::BOLD),
                 stats::StatRow::Total { .. } => Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
                 stats::StatRow::Chapter { .. } => Style::default(),
             };
@@ -3234,12 +3279,12 @@ fn render_stats(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace) {
+fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace, theme: &Theme) {
     let focused = ws.focus == Focus::Tree;
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" 目录 ")
-        .border_style(border_style(focused));
+        .border_style(border_style(focused, theme));
 
     let rows = ws.tree.rows(&ws.book);
     let inner_h = area.height.saturating_sub(2) as usize;
@@ -3297,7 +3342,7 @@ fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
+fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, theme: &Theme) {
     let focused = ws.focus == Focus::Editor;
     let title = match &ws.editor {
         Some(_) => format!(" 正文 · 《{}》 ", ws.book.title),
@@ -3306,7 +3351,7 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(border_style(focused));
+        .border_style(border_style(focused, theme));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3346,7 +3391,7 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
                     Some(sev) => spans.push(Span::styled(
                         seg.text,
                         Style::default()
-                            .fg(proof_severity_color(sev))
+                            .fg(proof_severity_color(sev, theme))
                             .add_modifier(Modifier::UNDERLINED),
                     )),
                 }
@@ -3355,7 +3400,10 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
         })
         .collect();
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(theme.fg)),
+        inner,
+    );
 
     let cursor_pos = open.viewport.cursor_screen_pos(&open.buffer);
 
@@ -3408,7 +3456,7 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
             frame.render_widget(ratatui::widgets::Clear, popup);
             let pblock = Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(theme.accent));
             let pinner = pblock.inner(popup);
             frame.render_widget(pblock, popup);
             let items: Vec<Line> = cands
@@ -3430,12 +3478,17 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace) {
 }
 
 /// 角色卡表单编辑（§6.7）。字段逐行，聚焦项高亮，编辑态末尾加光标符。
-fn render_character_form(frame: &mut ratatui::Frame, area: Rect, form: &mut CharacterForm) {
+fn render_character_form(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    form: &mut CharacterForm,
+    theme: &Theme,
+) {
     let dirty = if form.is_dirty() { " ●未保存" } else { "" };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" 编辑角色{dirty} "))
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3445,10 +3498,10 @@ fn render_character_form(frame: &mut ratatui::Frame, area: Rect, form: &mut Char
         let editing = focused && form.is_editing();
         let label_style = if focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.dim)
         };
         let marker = if focused { "▸ " } else { "  " };
         // 多行值可能含换行；首行跟在标签后，其余行缩进对齐。
@@ -3490,13 +3543,18 @@ fn render_character_form(frame: &mut ratatui::Frame, area: Rect, form: &mut Char
 }
 
 /// 角色速查侧栏 / 列表页（Alt+C，§6.7）。宽屏左列表右详情，窄屏只列表。
-fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPanel) {
+fn render_characters(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    p: &mut CharacterPanel,
+    theme: &Theme,
+) {
     // 出场统计视图（t 打开，§6.7 [SHOULD]）。
     if p.show_stats() {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" 角色出场统计 · 消失最久在前 ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(theme.accent));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         p.set_height(inner.height as usize);
@@ -3510,9 +3568,9 @@ fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPa
             .map(|(i, a)| {
                 // 长期未出现的标黄，未出场的压暗。
                 let mut style = if a.total == 0 {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.dim)
                 } else if a.chapters_since_last().is_some_and(|n| n >= 3) {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme.warning)
                 } else {
                     Style::default()
                 };
@@ -3534,7 +3592,7 @@ fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPa
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -3579,7 +3637,7 @@ fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPa
         // 竖分隔线用左边框近似。
         let dblock = Block::default()
             .borders(Borders::LEFT)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(theme.border));
         let dinner = dblock.inner(da);
         frame.render_widget(dblock, da);
         if let Some(c) = p.current() {
@@ -3595,20 +3653,20 @@ fn render_characters(frame: &mut ratatui::Frame, area: Rect, p: &mut CharacterPa
 }
 
 /// 校对严重度配色（§6.8：Error 红 / Warning 黄 / Hint 暗）。正文下划线与面板共用。
-fn proof_severity_color(sev: mj_text::proof::Severity) -> Color {
+fn proof_severity_color(sev: mj_text::proof::Severity, theme: &Theme) -> Color {
     use mj_text::proof::Severity;
     match sev {
-        Severity::Error => Color::Red,
-        Severity::Warning => Color::Yellow,
-        Severity::Hint => Color::DarkGray,
+        Severity::Error => theme.error,
+        Severity::Warning => theme.warning,
+        Severity::Hint => theme.hint,
     }
 }
 
-fn border_style(focused: bool) -> Style {
+fn border_style(focused: bool, theme: &Theme) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border)
     }
 }
 
