@@ -32,6 +32,7 @@ use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
 use crate::screens::modal::{Modal, ModalKind, ModalStack};
 use crate::screens::proof_panel::{self, ProofPanel};
 use crate::screens::search_panel::{self, SearchPanel};
+use crate::screens::settings::{self, Settings};
 use crate::screens::shelf::{Shelf, format_words};
 use crate::screens::stats::{self, Stats};
 use crate::screens::tree::{Row, Tree};
@@ -402,6 +403,7 @@ impl App {
                 ModalKind::Stats => self.on_key_stats(code),
                 ModalKind::Palette => self.on_key_palette(code, mods),
                 ModalKind::Help => self.on_key_help(code),
+                ModalKind::Settings => self.on_key_settings(code),
             };
         }
 
@@ -414,6 +416,8 @@ impl App {
                 }
                 return Ok(());
             }
+            // F2 外观设置（§6.10）。
+            KeyCode::F(2) => return self.run_command(Command::Appearance),
             // F1 帮助（键位总表，§7.3）。
             KeyCode::F(1) => {
                 if let Screen::Workspace(ws) = &mut self.screen {
@@ -1414,7 +1418,117 @@ impl App {
                 }
                 Ok(())
             }
+            Command::Appearance => self.open_settings(),
         }
+    }
+
+    /// 打开外观设置（§6.10）。
+    fn open_settings(&mut self) -> anyhow::Result<()> {
+        // 可选主题 = 内置 + 用户自建，去重。用户自建的同名主题会覆盖内置，
+        // 故只留一份名字。
+        let mut themes: Vec<String> = crate::theme::builtin_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for t in self.store.workspace().list_user_themes() {
+            if !themes.contains(&t) {
+                themes.push(t);
+            }
+        }
+        let a = &self.config.appearance;
+        let s = Settings::new(
+            themes,
+            &a.theme,
+            crate::font::TerminalKind::detect(),
+            a.column_width,
+            a.margin,
+            a.paragraph_spacing,
+            a.line_number,
+            a.font_family.clone(),
+            a.font_size,
+        );
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.modals.push(Modal::Settings(Box::new(s)));
+        }
+        Ok(())
+    }
+
+    fn on_key_settings(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        // 复制片段与关页面都要脱离对 ws 的借用。
+        match code {
+            KeyCode::Char('y') => {
+                let snip = match &self.screen {
+                    Screen::Workspace(ws) => ws
+                        .modals
+                        .settings()
+                        .filter(|s| s.current_row() == settings::Row::Snippet)
+                        .and_then(|s| s.snippet().map(|x| x.to_string())),
+                    _ => None,
+                };
+                if let Some(snip) = snip {
+                    crate::clipboard::copy(&snip);
+                    self.toast = Some("配置片段已复制（终端不回话，粘贴一下确认）".into());
+                }
+                return Ok(());
+            }
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => return self.close_settings(),
+            _ => {}
+        }
+
+        // 换主题要立刻生效——当场看得到，才谈得上「挑」主题。
+        let changed = {
+            let Screen::Workspace(ws) = &mut self.screen else {
+                return Ok(());
+            };
+            let Some(s) = ws.modals.settings_mut() else {
+                return Ok(());
+            };
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    s.move_down();
+                    false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    s.move_up();
+                    false
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => s.cycle_theme(true),
+                KeyCode::Left | KeyCode::Char('h') => s.cycle_theme(false),
+                _ => false,
+            }
+        };
+        if changed {
+            let name = match &self.screen {
+                Screen::Workspace(ws) => ws.modals.settings().map(|s| s.theme().to_string()),
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.config.appearance.theme = name;
+                self.theme = Self::resolve_theme(&self.store, &self.config);
+            }
+        }
+        Ok(())
+    }
+
+    /// 关设置页。主题改过就写回 config.toml。
+    fn close_settings(&mut self) -> anyhow::Result<()> {
+        let dirty = match &self.screen {
+            Screen::Workspace(ws) => ws.modals.settings().is_some_and(|s| s.is_dirty()),
+            _ => false,
+        };
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.modals.close_kind(ModalKind::Settings);
+        }
+        if dirty {
+            let path = self.store.workspace().config_file();
+            match self.config.save(&path) {
+                Ok(()) => {
+                    self.toast = Some(format!("主题已存为「{}」", self.config.appearance.theme))
+                }
+                Err(e) => self.toast = Some(format!("主题已切换，但写盘失败：{e}")),
+            }
+        }
+        Ok(())
     }
 
     /// 撤销/重做当前正文。
@@ -2823,6 +2937,7 @@ impl App {
                         Modal::Confirm(c) => render_confirm(frame, body, c, theme),
                         Modal::Palette(p) => render_palette(frame, body, p, theme),
                         Modal::Help(h) => render_help(frame, body, h, theme),
+                        Modal::Settings(s) => render_settings(frame, body, s, theme),
                         Modal::Stats(st) => {
                             if let Some(rows) = &stats_rows {
                                 render_stats(frame, body, st, rows, &book_title, theme);
@@ -2855,6 +2970,11 @@ impl App {
                 }
                 Screen::Workspace(ws) if ws.modals.top_is(ModalKind::Help) => {
                     spans.push(Span::raw(" 帮助 │ j/k 滚动 │ Esc 关闭 "));
+                }
+                Screen::Workspace(ws) if ws.modals.top_is(ModalKind::Settings) => {
+                    spans.push(Span::raw(
+                        " 外观 │ j/k 移动 │ ←/→ 换主题 │ y 复制配置片段 │ Esc 关闭 ",
+                    ));
                 }
                 Screen::Workspace(ws) if ws.modals.contains(ModalKind::CharacterForm) => {
                     let editing = ws.modals.character_form().is_some_and(|f| f.is_editing());
@@ -3895,6 +4015,73 @@ fn render_palette(frame: &mut ratatui::Frame, area: Rect, p: &mut CommandPalette
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// 外观设置（§6.10）。字体不可用的那两栏置灰并给出原因，末尾附配置片段。
+fn render_settings(frame: &mut ratatui::Frame, area: Rect, s: &mut Settings, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 外观 · 终端：{}（←/→ 换主题，y 复制片段，Esc 关闭） ",
+            s.terminal().label()
+        ))
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in s.rows().iter().enumerate() {
+        let selected = i == s.cursor();
+        let disabled = s.is_disabled(*row);
+        // 灰态：不可用的项压暗，用户一眼看出「这里点了也没用」（§6.10 [MUST]）。
+        let value_style = if disabled {
+            Style::default().fg(theme.dim)
+        } else if selected {
+            Style::default()
+                .fg(theme.selection_fg)
+                .bg(theme.selection_bg)
+        } else {
+            Style::default().fg(theme.fg)
+        };
+        let label_style = if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        let marker = if selected { "▸ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{:<10}", row.label()), label_style),
+            Span::styled(s.value_of(*row), value_style),
+        ]));
+        if let Some(note) = s.note_of(*row) {
+            lines.push(Line::from(Span::styled(
+                format!("            {note}"),
+                Style::default().fg(theme.dim),
+            )));
+        }
+    }
+
+    // 配置片段正文——把「做不到」变成「帮你做到」的那一段（§2.1 三级降级）。
+    if let Some(snip) = s.snippet() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "── 配置片段（y 复制）──",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for l in snip.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("    {l}"),
+                Style::default().fg(theme.warning),
+            )));
+        }
+    }
+
+    let view: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
+    frame.render_widget(Paragraph::new(view), inner);
 }
 
 /// 帮助页（F1，§7.3）：键位总表，内容由命令表生成。

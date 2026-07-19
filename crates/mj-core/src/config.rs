@@ -238,6 +238,25 @@ impl Config {
             source: Box::new(source),
         })
     }
+
+    /// 写回配置（原子写）。
+    ///
+    /// 各层的 `extra`（`#[serde(flatten)]`）会把读进来时不认识的字段一并写回去，
+    /// 故用新版本的墨简改一个主题，不会顺手删掉旧版本或未来版本写的配置
+    /// （§8 前向兼容：多余字段保留不报错）。
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = toml::to_string_pretty(self).map_err(|e| Error::ChapterParse {
+            path: path.to_owned(),
+            message: e.to_string(),
+        })?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+        }
+        crate::atomic::write(path, text.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +264,42 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// 写回再读出应当一模一样。
+    #[test]
+    fn save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut c = Config::default();
+        c.appearance.theme = "high_contrast".into();
+        c.appearance.margin = 8;
+        c.save(&path).unwrap();
+
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back.appearance.theme, "high_contrast");
+        assert_eq!(back.appearance.margin, 8);
+    }
+
+    /// §8 前向兼容：读进来时不认识的字段，写回去不能丢——
+    /// 否则用新版墨简改一次主题，就把旧版/未来版写的配置顺手删了。
+    #[test]
+    fn save_preserves_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[appearance]\ntheme = \"sepia\"\nfuture_option = 42\n",
+        )
+        .unwrap();
+
+        let mut c = Config::load(&path).unwrap();
+        c.appearance.theme = "dark".into();
+        c.save(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("future_option"), "未知字段被写没了：{text}");
+        assert!(text.contains("dark"));
+    }
 
     #[test]
     fn missing_file_yields_defaults() {

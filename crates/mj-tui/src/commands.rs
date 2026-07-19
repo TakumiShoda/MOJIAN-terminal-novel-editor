@@ -31,6 +31,7 @@ pub enum Command {
     Stats,
     // 视图
     ToggleTree,
+    Appearance,
     // 帮助
     Help,
 }
@@ -212,6 +213,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "切换目录树",
         desc: "显示/隐藏左侧目录",
         keys: "Ctrl+B",
+        category: Category::View,
+    },
+    CommandSpec {
+        cmd: Command::Appearance,
+        name: "外观",
+        desc: "换主题、看版面设置；字体不可用时给终端配置片段",
+        keys: "F2",
         category: Category::View,
     },
     // ---- 帮助 ----

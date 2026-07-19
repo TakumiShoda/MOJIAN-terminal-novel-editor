@@ -16,7 +16,7 @@
 
 use super::{
     CharacterForm, CharacterPanel, CommandPalette, Confirm, DiffView, FormatPreview, Help,
-    HistoryPanel, ProofPanel, SearchPanel, Stats,
+    HistoryPanel, ProofPanel, SearchPanel, Settings, Stats,
 };
 
 /// 一层浮层。
@@ -38,6 +38,8 @@ pub enum Modal {
     Palette(Box<CommandPalette>),
     /// 帮助页（F1）。
     Help(Box<Help>),
+    /// 外观设置（§6.10）。
+    Settings(Box<Settings>),
 }
 
 /// 浮层种类，供日志/测试断言「现在栈上是什么」。
@@ -54,6 +56,7 @@ pub enum ModalKind {
     CharacterForm,
     Palette,
     Help,
+    Settings,
 }
 
 impl Modal {
@@ -80,6 +83,7 @@ impl Modal {
             Self::CharacterForm(_) => ModalKind::CharacterForm,
             Self::Palette(_) => ModalKind::Palette,
             Self::Help(_) => ModalKind::Help,
+            Self::Settings(_) => ModalKind::Settings,
         }
     }
 }
@@ -209,6 +213,7 @@ impl ModalStack {
     );
     accessor!(palette, palette_mut, Palette, CommandPalette);
     accessor!(help, help_mut, Help, Help);
+    accessor!(settings, settings_mut, Settings, Settings);
 }
 
 #[cfg(test)]
