@@ -43,6 +43,14 @@ use crate::theme::{ColorDepth, Theme};
 
 /// §7.2：目录树宽度默认 24 列。
 const TREE_WIDTH: u16 = 24;
+/// 侧栏能被拖到的最窄宽度。再窄连「第一章」加边框都放不下，
+/// 拖成一条缝之后用户只能靠 Ctrl+B 收起再展开才找得回来。
+const TREE_MIN_WIDTH: u16 = 12;
+
+/// 侧栏能被拖到的最宽宽度：不许越过一半，正文才是主角。
+fn tree_max_width(total: u16) -> u16 {
+    (total / 2).max(TREE_MIN_WIDTH)
+}
 /// §7.2：终端宽度 < 80 列时自动隐藏侧栏。
 const NARROW_THRESHOLD: u16 = 80;
 
@@ -81,6 +89,9 @@ struct Workspace {
     completion: Option<Completion>,
     /// 上一帧画出来的命中区域（§13 鼠标支持）。
     hit: Hit,
+    /// 侧栏宽度（§13：可拖分隔条）。只活在本次会话——每拖一格就写一次
+    /// config.toml 太吵，而这本就是随手调的东西，不值当为它反复动用户的配置文件。
+    tree_width: u16,
 }
 
 /// 鼠标要落到哪块区域，只能照**上一帧**的版面判——事件到达时这一帧早画完了。
@@ -160,6 +171,8 @@ pub struct App {
     llm_job: Option<LlmJob>,
     /// 工作线程的回传端。`App::new` 时还没有事件循环，故由 `run_loop` 装上。
     events_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
+    /// 正按着分隔条拖（§13）。
+    dragging_divider: bool,
 }
 
 /// 在跑的那趟模型校对。
@@ -212,6 +225,7 @@ impl App {
             keymap,
             llm_job: None,
             events_tx: None,
+            dragging_divider: false,
         })
     }
 
@@ -454,6 +468,7 @@ impl App {
             proof_issues: Vec::new(),
             completion: None,
             hit: Hit::default(),
+            tree_width: TREE_WIDTH,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -2044,7 +2059,9 @@ impl App {
             MouseEventKind::ScrollUp => self.wheel(true, m.column, m.row),
             MouseEventKind::ScrollDown => self.wheel(false, m.column, m.row),
             MouseEventKind::Down(MouseButton::Left) => return self.mouse_click(m.column, m.row),
-            // 其余（中键、右键、拖拽、移动）暂不接管，留给终端自己。
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_divider(m.column),
+            MouseEventKind::Up(_) => self.dragging_divider = false,
+            // 其余（中键、右键、移动）暂不接管，留给终端自己。
             _ => return Ok(()),
         }
         Ok(())
@@ -2104,6 +2121,15 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
+
+        // 分隔条要在选行**之前**判：它就是侧栏的右边框，那一列同时落在树的
+        // 命中框里。先判行的话，想拖分隔条会变成选中最后点到的那一章。
+        if let Some((area, _)) = ws.hit.tree
+            && col == area.x + area.width.saturating_sub(1)
+        {
+            self.dragging_divider = true;
+            return Ok(());
+        }
 
         if let Some((area, top)) = ws.hit.tree
             && Self::within(area, col, row)
@@ -2165,6 +2191,21 @@ impl App {
         }
         // 点在行尾之后：贴到行尾。
         Some(line.range.end)
+    }
+
+    /// 拖分隔条（§13）。松手前每动一列就跟着走一列。
+    fn drag_divider(&mut self, col: u16) {
+        if !self.dragging_divider {
+            return;
+        }
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return;
+        };
+        let Some((area, _)) = ws.hit.tree else { return };
+        // 鼠标在哪一列，右边框就到哪一列——宽度是「从侧栏左沿到这里」再加 1。
+        let total = area.width + ws.hit.editor.width;
+        ws.tree_width =
+            (col.saturating_sub(area.x) + 1).clamp(TREE_MIN_WIDTH, tree_max_width(total));
     }
 
     fn within(r: Rect, col: u16, row: u16) -> bool {
@@ -3158,6 +3199,15 @@ impl App {
         })
     }
 
+    /// 供测试：当前侧栏宽度（§13 拖分隔条）。
+    #[doc(hidden)]
+    pub fn tree_width_for_test(&self) -> u16 {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.tree_width,
+            _ => 0,
+        }
+    }
+
     /// 供测试：正文光标的字节位置与视口顶行。
     #[doc(hidden)]
     pub fn editor_pos_for_test(&self) -> Option<(usize, usize)> {
@@ -3721,8 +3771,10 @@ fn render_workspace(
     let show_tree = ws.show_tree && !narrow;
 
     let (tree_area, editor_area) = if show_tree {
-        let [t, e] =
-            Layout::horizontal([Constraint::Length(TREE_WIDTH), Constraint::Min(0)]).areas(area);
+        let w = ws
+            .tree_width
+            .clamp(TREE_MIN_WIDTH, tree_max_width(area.width));
+        let [t, e] = Layout::horizontal([Constraint::Length(w), Constraint::Min(0)]).areas(area);
         (Some(t), e)
     } else {
         (None, area)

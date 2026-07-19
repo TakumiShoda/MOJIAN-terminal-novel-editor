@@ -216,6 +216,144 @@ fn clicking_further_right_moves_the_cursor_further() {
     );
 }
 
+// ---- 拖分隔条（§13）----
+
+fn press(app: &mut App, col: u16, row: u16) {
+    app.mouse_for_test(MouseEventKind::Down(MouseButton::Left), col, row)
+        .unwrap();
+}
+fn drag(app: &mut App, col: u16, row: u16) {
+    app.mouse_for_test(MouseEventKind::Drag(MouseButton::Left), col, row)
+        .unwrap();
+}
+fn release(app: &mut App, col: u16, row: u16) {
+    app.mouse_for_test(MouseEventKind::Up(MouseButton::Left), col, row)
+        .unwrap();
+}
+
+/// 侧栏右边框那一列的下标（= 侧栏宽度 - 1）。
+fn divider_x(app: &mut App) -> u16 {
+    app.tree_width_for_test() - 1
+}
+
+#[test]
+fn dragging_the_divider_resizes_the_sidebar() {
+    let f = setup();
+    let mut app = f.app();
+    draw(&mut app);
+    let before = app.tree_width_for_test();
+
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, x + 10, 5);
+    release(&mut app, x + 10, 5);
+    let after = app.tree_width_for_test();
+    assert_eq!(after, before + 10, "拖多远侧栏就该宽多少");
+
+    // 反向拖回去。
+    draw(&mut app);
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, x - 6, 5);
+    release(&mut app, x - 6, 5);
+    assert_eq!(app.tree_width_for_test(), after - 6);
+}
+
+/// 松手之后再动鼠标，侧栏不该跟着走。
+#[test]
+fn moving_after_release_does_not_resize() {
+    let f = setup();
+    let mut app = f.app();
+    draw(&mut app);
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, x + 8, 5);
+    release(&mut app, x + 8, 5);
+    let settled = app.tree_width_for_test();
+
+    drag(&mut app, x + 30, 5);
+    assert_eq!(app.tree_width_for_test(), settled, "松手后不该再跟着动");
+}
+
+/// 没按下就直接拖（比如在别处按下再划过来）：不该改宽度。
+#[test]
+fn drag_without_press_is_ignored() {
+    let f = setup();
+    let mut app = f.app();
+    draw(&mut app);
+    let before = app.tree_width_for_test();
+    drag(&mut app, 60, 5);
+    assert_eq!(app.tree_width_for_test(), before);
+}
+
+/// 拖到极端也要留得住：太窄放不下章名，太宽就把正文挤没了。
+#[test]
+fn divider_is_clamped_at_both_ends() {
+    let f = setup();
+    let mut app = f.app();
+
+    draw(&mut app);
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, 0, 5); // 一路拖到最左
+    release(&mut app, 0, 5);
+    let narrow = app.tree_width_for_test();
+    assert!(narrow >= 12, "不该窄到放不下章名：{narrow}");
+
+    draw(&mut app);
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, W - 1, 5); // 一路拖到最右
+    release(&mut app, W - 1, 5);
+    let wide = app.tree_width_for_test();
+    assert!(wide <= W / 2, "侧栏不该越过一半，正文才是主角：{wide}");
+}
+
+/// 分隔条判定必须排在选行**之前**。
+///
+/// 边框那一列同时落在树的命中框里；先判行的话，想拖分隔条会先把最后点到的
+/// 那一章打开——一次误开章比拖不动更烦人。
+#[test]
+fn pressing_the_divider_does_not_open_a_chapter() {
+    let f = setup();
+    let mut app = f.app();
+    draw(&mut app);
+    let before = app.current_chapter_for_test();
+
+    // 第二章那一行的高度上，按在分隔条那一列。
+    let x = divider_x(&mut app);
+    press(&mut app, x, 3);
+    assert_eq!(
+        app.current_chapter_for_test(),
+        before,
+        "按分隔条不该顺手开了章"
+    );
+}
+
+/// 拖完之后版面真的按新宽度画，且正文点击仍然点得准。
+#[test]
+fn layout_follows_the_new_width() {
+    let f = setup();
+    let mut app = f.app();
+    draw(&mut app);
+    let x = divider_x(&mut app);
+    press(&mut app, x, 5);
+    drag(&mut app, x + 10, 5);
+    release(&mut app, x + 10, 5);
+    draw(&mut app);
+
+    // 侧栏宽了 10 列，正文整体右移；点正文仍应落在字素簇边界上。
+    let text = app.buffer_text_for_test().unwrap();
+    for col in [50u16, 60, 70, 80] {
+        click(&mut app, col, 5);
+        let (cursor, _) = app.editor_pos_for_test().unwrap();
+        assert!(
+            text.is_char_boundary(cursor),
+            "拖宽侧栏后 col={col} 落在了字符中间"
+        );
+    }
+}
+
 /// 滚轮滚到浮层上：走键盘那条路，等于按上下键。
 #[test]
 fn wheel_scrolls_the_top_modal() {
