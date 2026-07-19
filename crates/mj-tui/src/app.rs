@@ -11,7 +11,9 @@ use mj_core::id::{BookId, ChapterId};
 use mj_core::model::{Book, ChapterBody};
 use mj_core::store::Store;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -77,6 +79,20 @@ struct Workspace {
     ///
     /// **不进浮层栈**：键仍然打进缓冲，它不夺焦点，只是跟随光标的候选框。
     completion: Option<Completion>,
+    /// 上一帧画出来的命中区域（§13 鼠标支持）。
+    hit: Hit,
+}
+
+/// 鼠标要落到哪块区域，只能照**上一帧**的版面判——事件到达时这一帧早画完了。
+/// 这不是将就：用户看着那一帧点的，就该按那一帧算。
+#[derive(Default, Clone, Copy)]
+struct Hit {
+    /// 目录树的外框，以及它上一帧滚到了第几行（树是虚拟化的，不记就换算不回行号）。
+    tree: Option<(Rect, usize)>,
+    /// 正文那一侧的整块（含边框留白），用来判「滚轮是不是在正文上」。
+    editor: Rect,
+    /// 正文**真正**落笔的那块。定位光标必须用它——用外框会差出边框和留白。
+    body: Rect,
 }
 
 impl Workspace {
@@ -344,6 +360,12 @@ impl App {
                     self.dirty = true;
                 }
                 AppEvent::Term(Event::Resize(_, _)) => self.dirty = true,
+                // 鼠标只在配置开了时才被捕获，走到这里就说明用户要它（§13）。
+                AppEvent::Term(Event::Mouse(m)) => {
+                    self.toast = None;
+                    self.on_mouse(m)?;
+                    self.dirty = true;
+                }
                 AppEvent::Term(_) => {}
                 // 自动保存的心跳（§7.4：Tick 驱动自动保存计时）。
                 AppEvent::Tick => self.on_tick()?,
@@ -431,6 +453,7 @@ impl App {
             batch: None,
             proof_issues: Vec::new(),
             completion: None,
+            hit: Hit::default(),
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
         if let Some(first) = ws.book.volumes.iter().flat_map(|v| &v.chapters).next() {
@@ -2002,6 +2025,152 @@ impl App {
         Ok(())
     }
 
+    // ---- 鼠标（§13 [SHOULD]）----
+    //
+    // 一条总原则：鼠标**不新增语义**。滚轮 = 那块区域本来就有的滚动，点击 = 把
+    // 选中挪过去再做 Enter 会做的事。这样「§13 [MUST] 所有功能不依赖鼠标」自动成立
+    // ——鼠标能做的键盘全都能做，而且两边行为不可能走偏，因为走的是同一段代码。
+
+    /// 滚轮一格滚几行。三行是通例。
+    const WHEEL_LINES: usize = 3;
+
+    /// 配置里开没开鼠标（§13）。`run` 据此决定要不要捕获。
+    pub fn mouse_enabled(&self) -> bool {
+        self.config.input.mouse
+    }
+
+    pub(crate) fn on_mouse(&mut self, m: MouseEvent) -> anyhow::Result<()> {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.wheel(true, m.column, m.row),
+            MouseEventKind::ScrollDown => self.wheel(false, m.column, m.row),
+            MouseEventKind::Down(MouseButton::Left) => return self.mouse_click(m.column, m.row),
+            // 其余（中键、右键、拖拽、移动）暂不接管，留给终端自己。
+            _ => return Ok(()),
+        }
+        Ok(())
+    }
+
+    /// 滚轮。有浮层就滚浮层，否则按落点滚树或正文。
+    fn wheel(&mut self, up: bool, col: u16, row: u16) {
+        // 浮层：直接喂它本来就吃的上下键——列表怎么滚由它自己说了算。
+        if matches!(&self.screen, Screen::Workspace(ws) if !ws.modals.is_empty()) {
+            let code = if up { KeyCode::Up } else { KeyCode::Down };
+            for _ in 0..Self::WHEEL_LINES {
+                // 走键盘那条路：栈顶浮层吃键，滚轮于是天然等于按上下键。
+                let _ = self.on_key_workspace(code, KeyModifiers::NONE);
+            }
+            return;
+        }
+
+        match &mut self.screen {
+            Screen::Shelf(shelf) => {
+                for _ in 0..Self::WHEEL_LINES {
+                    if up {
+                        shelf.move_up();
+                    } else {
+                        shelf.move_down();
+                    }
+                }
+            }
+            Screen::Workspace(ws) => {
+                let over_tree = ws.hit.tree.is_some_and(|(r, _)| Self::within(r, col, row));
+                if over_tree {
+                    // 树没有独立的滚动位置，滚动就是移选中——键盘上也是这样。
+                    for _ in 0..Self::WHEEL_LINES {
+                        if up {
+                            ws.tree.move_up();
+                        } else {
+                            ws.tree.move_down(&ws.book);
+                        }
+                    }
+                } else if let Some(open) = &mut ws.editor {
+                    // 正文滚的是**视口**，不动光标——滚轮看两眼别处不该把光标带走。
+                    if up {
+                        open.viewport.scroll_up(Self::WHEEL_LINES);
+                    } else {
+                        open.viewport.scroll_down(Self::WHEEL_LINES, &open.buffer);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 左键按下。
+    fn mouse_click(&mut self, col: u16, row: u16) -> anyhow::Result<()> {
+        // 浮层开着时不接管点击：浮层盖住的坐标算不清，点错比不响应更糟。
+        if matches!(&self.screen, Screen::Workspace(ws) if !ws.modals.is_empty()) {
+            return Ok(());
+        }
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+
+        if let Some((area, top)) = ws.hit.tree
+            && Self::within(area, col, row)
+        {
+            // 边框各占一行/一列，内容从 area.y + 1 起。
+            let Some(offset) = row.checked_sub(area.y + 1) else {
+                return Ok(());
+            };
+            let idx = top + offset as usize;
+            if idx >= ws.tree.rows(&ws.book).len() {
+                return Ok(()); // 点在空白处
+            }
+            ws.focus = Focus::Tree;
+            let book = &ws.book;
+            ws.tree.set_cursor(idx, book);
+            // 之后交给 Enter 的那条路：章就打开，卷就折叠/展开。
+            return self.on_key_tree(KeyCode::Enter, KeyModifiers::NONE);
+        }
+
+        if Self::within(ws.hit.editor, col, row)
+            && let Some(open) = &mut ws.editor
+        {
+            ws.focus = Focus::Editor;
+            if let Some(byte) = Self::byte_at(open, ws.hit.body, col, row) {
+                open.buffer.clear_selection();
+                open.buffer.move_to(byte);
+            }
+        }
+        Ok(())
+    }
+
+    /// 屏幕坐标 → 缓冲字节位置。落在行尾之后就贴到行尾。
+    ///
+    /// 照 `visible_lines` 的排版结果反查，而不是自己再算一遍换行——正文按显示宽度
+    /// 折行、CJK 占两列、段间距还会撑出不对应任何字节的空行，重算一遍必然对不上。
+    fn byte_at(open: &OpenChapter, area: Rect, col: u16, row: u16) -> Option<usize> {
+        use unicode_segmentation::UnicodeSegmentation as _;
+        use unicode_width::UnicodeWidthStr as _;
+
+        let lines = open.viewport.visible_lines(&open.buffer);
+        let line = lines.get(row.checked_sub(area.y)? as usize)?;
+        let text = open
+            .buffer
+            .text()
+            .byte_slice(line.range.clone())
+            .to_string();
+        let text = text.as_str();
+        // 目标列减去渲染时补的缩进；点在缩进里就算行首。
+        let target = usize::from(col.saturating_sub(area.x)).saturating_sub(line.indent);
+
+        // 按显示宽度往前走，走过目标列就是它。字素簇为单位（§0：光标按字素簇动）。
+        let mut used = 0usize;
+        for (off, g) in text.grapheme_indices(true) {
+            let w = g.width().max(1);
+            if used + w > target {
+                return Some(line.range.start + off);
+            }
+            used += w;
+        }
+        // 点在行尾之后：贴到行尾。
+        Some(line.range.end)
+    }
+
+    fn within(r: Rect, col: u16, row: u16) -> bool {
+        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+    }
+
     // ---- 模型校对（§6.8 第 3 条）----
 
     /// 正文指纹。工作线程回来时用它判断结果还作不作数。
@@ -2969,6 +3138,38 @@ impl App {
         self.on_key(code, mods)
     }
 
+    /// 供测试：送一个鼠标事件。
+    ///
+    /// 命中区域是渲染时记下的，所以调用前必须先 `render_for_test` 画一帧——
+    /// 真实主循环也正是这个次序（先画，用户看着画面点，事件才来）。
+    #[doc(hidden)]
+    pub fn mouse_for_test(
+        &mut self,
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+    ) -> anyhow::Result<()> {
+        self.toast = None;
+        self.on_mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// 供测试：正文光标的字节位置与视口顶行。
+    #[doc(hidden)]
+    pub fn editor_pos_for_test(&self) -> Option<(usize, usize)> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws
+                .editor
+                .as_ref()
+                .map(|o| (o.buffer.cursor(), o.viewport.top_logical())),
+            _ => None,
+        }
+    }
+
     /// 供测试：跑到批量作业结束（真实主循环是分片跑的，这里一次跑完）。
     #[doc(hidden)]
     pub fn drain_batch_for_test(&mut self) -> anyhow::Result<()> {
@@ -3530,7 +3731,27 @@ fn render_workspace(
     if let Some(ta) = tree_area {
         render_tree(frame, ta, ws, theme);
     }
-    render_editor(frame, editor_area, ws, theme, show_cursor, layout);
+    let body = render_editor(frame, editor_area, ws, theme, show_cursor, layout);
+
+    // 记下这一帧的版面，下一个鼠标事件照它判命中（见 `Hit`）。
+    ws.hit = Hit {
+        tree: tree_area.map(|ta| (ta, tree_scroll_top(ta, ws))),
+        editor: editor_area,
+        body,
+    };
+}
+
+/// 目录树上一帧滚到了第几行。
+///
+/// 与 `render_tree` 里那段是同一个算法——两处都要用，必须共用一份，
+/// 否则改了渲染忘了改这里，鼠标就会点到隔壁那一章去。
+fn tree_scroll_top(area: Rect, ws: &Workspace) -> usize {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let rows = ws.tree.rows(&ws.book).len();
+    ws.tree
+        .cursor()
+        .saturating_sub(inner_h / 2)
+        .min(rows.saturating_sub(inner_h))
 }
 
 /// 历史面板（§6.9）。
@@ -4046,11 +4267,8 @@ fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace, theme: &T
     let inner_h = area.height.saturating_sub(2) as usize;
 
     // 树也要虚拟化：四百章的书不该每帧构造四百行。
-    let top = ws
-        .tree
-        .cursor()
-        .saturating_sub(inner_h / 2)
-        .min(rows.len().saturating_sub(inner_h));
+    // 滚动位置由 `tree_scroll_top` 算——鼠标命中也要用它，两处必须是同一份。
+    let top = tree_scroll_top(area, ws);
 
     let mut lines = Vec::new();
     for (i, row) in rows.iter().enumerate().skip(top).take(inner_h) {
@@ -4105,7 +4323,7 @@ fn render_editor(
     theme: &Theme,
     show_cursor: bool,
     layout: &EditorLayout,
-) {
+) -> Rect {
     let focused = ws.focus == Focus::Editor;
     let title = match &ws.editor {
         Some(_) => format!(" 正文 · 《{}》 ", ws.book.title),
@@ -4128,7 +4346,8 @@ fn render_editor(
             Paragraph::new(vec![Line::from(""), Line::from("选一章开始写").centered()]),
             inner,
         );
-        return;
+        // 没开章节，正文块是空的——鼠标点这儿什么也定位不到。
+        return Rect::default();
     };
 
     // 版面：先按留白与栏宽算出正文该占的横向范围（§6.10）。
@@ -4142,6 +4361,14 @@ fn render_editor(
     };
     let body_x = text_x + gutter;
     let body_w = text_w.saturating_sub(gutter).max(1);
+    // 正文**真正**落笔的那块（去掉边框、留白、行号槽）。鼠标要按它换算，
+    // 拿外框算会差出边框和留白那几列几行，点谁都点不准。
+    let body_rect = Rect {
+        x: body_x,
+        y: inner.y,
+        width: body_w,
+        height: inner.height,
+    };
 
     // 视口宽度必须**等于实际绘制宽度**，否则折行的位置和画出来的对不上，
     // 行尾会溢出到留白里。
@@ -4292,6 +4519,7 @@ fn render_editor(
             frame.render_widget(Paragraph::new(items), pinner);
         }
     }
+    body_rect
 }
 
 /// 角色卡表单编辑（§6.7）。字段逐行，聚焦项高亮，编辑态末尾加光标符。
@@ -4741,10 +4969,29 @@ pub fn run(store: Store, config: Config) -> anyhow::Result<()> {
         app.note_keyboard_protocol();
     }
 
+    // 鼠标捕获（§13）。默认关——开了终端自己的拖选复制就没了，见 config 的注释。
+    //
+    // 关掉它是**必须做到**的事，不是收尾的客气：留着捕获退出去，用户的终端
+    // 就在这个目录下再也划不动选区了，而他多半想不到是刚才那个程序干的。
+    // 故下面 disable 不受 result 影响，无论 run_loop 怎么结束都要跑。
+    let mouse = app.mouse_enabled();
+    if mouse {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::EnableMouseCapture
+        );
+    }
+
     let events = EventLoop::spawn();
     let result = app.run_loop(&mut term, &events);
 
     // 顺序要紧：先把我们改过的终端状态收回来，再交还给 ratatui 复原。
+    if mouse {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
+    }
     crate::keyboard::disable();
     crate::font::emit_reset_sequence();
     ratatui::try_restore()?;

@@ -28,6 +28,9 @@ pub struct Config {
     pub history: History,
     #[serde(default)]
     pub appearance: Appearance,
+    /// 输入设备（§13：鼠标可选支持）。
+    #[serde(default)]
+    pub input: Input,
     /// 校对规则开关与阈值（§6.8、§8 `[proof]`）。
     #[serde(default)]
     pub proof: Proof,
@@ -309,6 +312,21 @@ impl Proof {
             style,
         }
     }
+}
+
+/// 输入设备（§13）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Input {
+    /// 鼠标支持（§13 `[SHOULD]`「鼠标可选支持（点击树、拖分隔条、滚轮）」）。
+    ///
+    /// **默认关**，而且这不是保守，是因为开它有代价：一旦程序捕获鼠标，
+    /// 终端自己的「拖选一段文字复制」就没了——那是很多人每天都在用的东西。
+    /// §13 同时写着「`[MUST]` 所有功能不依赖鼠标」，可见鼠标本就是添头；
+    /// 为一个添头默认拿掉用户已有的能力，不划算。想要的人写一行开。
+    pub mouse: bool,
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

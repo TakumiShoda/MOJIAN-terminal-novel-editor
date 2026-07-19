@@ -88,6 +88,12 @@ impl Tree {
         }
     }
 
+    /// 直接把选中挪到第 `i` 行（鼠标点击用）。越界贴到最后一行。
+    pub fn set_cursor(&mut self, i: usize, book: &Book) {
+        let n = self.rows(book).len();
+        self.cursor = i.min(n.saturating_sub(1));
+    }
+
     pub fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
