@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use mj_core::config::Config;
-use mj_core::export::{self, Format};
+use mj_core::export::{self, Format, TextFormat};
 use mj_core::store::Store;
 use mj_core::workspace::Workspace;
 
@@ -48,7 +48,7 @@ fn markdown_roundtrips_through_disk() {
     let mut s = store(&dir);
 
     let id = export::import_markdown(&mut s, SRC, "备用书名").unwrap();
-    let out = export::export(&s, id, Format::Md).unwrap();
+    let out = export::export(&s, id, TextFormat::Md).unwrap();
 
     assert_eq!(out, SRC, "经磁盘往返后应与原文一致");
 }
@@ -83,7 +83,7 @@ fn paragraph_indentation_survives() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(&dir);
     let id = export::import_markdown(&mut s, SRC, "x").unwrap();
-    let out = export::export(&s, id, Format::Md).unwrap();
+    let out = export::export(&s, id, TextFormat::Md).unwrap();
     assert!(
         out.contains("　　雪落了一夜。"),
         "段首全角空格被吃了：{out}"
@@ -108,7 +108,7 @@ fn txt_export_has_no_markdown_marks() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(&dir);
     let id = export::import_markdown(&mut s, SRC, "x").unwrap();
-    let out = export::export(&s, id, Format::Txt).unwrap();
+    let out = export::export(&s, id, TextFormat::Txt).unwrap();
     assert!(!out.contains('#'), "{out}");
     assert!(out.contains("第一章 雪夜"), "{out}");
     assert!(out.contains("　　路很长。"), "{out}");
@@ -151,4 +151,41 @@ fn export_to_file_writes_it() {
     export::export_to_file(&s, id, Format::Md, &out).unwrap();
     let text = std::fs::read_to_string(&out).unwrap();
     assert_eq!(text, SRC, "落到文件里的内容应与导出一致");
+}
+
+/// 从磁盘上的一本书导出 epub，落成真文件，再当 zip 读回来（§12.2、§11 M7）。
+///
+/// `epub.rs` 的单测覆盖了打包本身；这里补的是「store → 文件」这一段：
+/// 章节顺序、书名作者有没有真从磁盘取到，以及写出来的确实是个能被解开的 zip。
+#[test]
+fn export_epub_writes_a_readable_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(&dir);
+    let id = export::import_markdown(&mut s, SRC, "x").unwrap();
+
+    let out = dir.path().join("book.epub");
+    export::export_to_file(&s, id, Format::Epub, &out).unwrap();
+
+    let bytes = std::fs::read(&out).unwrap();
+    // mimetype 必须第一个、不压缩、内容正好那 20 字节——阅读器按固定偏移认它。
+    assert_eq!(&bytes[30..38], b"mimetype");
+    assert_eq!(&bytes[38..58], b"application/epub+zip");
+
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let names: Vec<String> = z.file_names().map(|s| s.to_string()).collect();
+    assert_eq!(names[0], "mimetype");
+    assert!(names.iter().any(|n| n == "OEBPS/content.opf"));
+
+    let mut opf = String::new();
+    std::io::Read::read_to_string(&mut z.by_name("OEBPS/content.opf").unwrap(), &mut opf).unwrap();
+    // 书名/作者要真从磁盘上那本书取，章数要对得上。
+    assert!(opf.contains("<dc:title>雪夜行</dc:title>"), "{opf}");
+    assert!(opf.contains("<dc:creator>沈砚</dc:creator>"), "{opf}");
+    assert_eq!(opf.matches("<itemref").count(), 3, "SRC 里是 3 章：{opf}");
+}
+
+/// epub 渲染不成一篇文本，这件事在类型上就该是写不出来的。
+#[test]
+fn epub_has_no_text_form() {
+    assert_eq!(Format::Epub.as_text(), None);
 }

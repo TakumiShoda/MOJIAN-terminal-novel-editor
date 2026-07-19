@@ -34,7 +34,7 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// 导出（epub 属 M7，暂只支持 txt / md）
+    /// 导出为 txt / md / epub
     Export {
         /// 书 id 或书名
         book: String,
@@ -117,9 +117,7 @@ fn run_tui(ws: &Workspace) -> anyhow::Result<()> {
 /// `mj export`（doc.md §12.2）。
 fn export(ws: &Workspace, book: &str, format: &str, out: &std::path::Path) -> anyhow::Result<()> {
     let Some(fmt) = mj_core::export::Format::parse(format) else {
-        // epub 在 clap 的取值表里（§12.2 就是这么列的），但它属 M7。
-        // 与其导出一个空壳 epub，不如说清楚还没有。
-        anyhow::bail!("暂不支持 {format} 格式（epub 属 M7）；可用 txt 或 md");
+        anyhow::bail!("不认识 {format} 格式；可用 txt、md 或 epub");
     };
     let config = Config::load(&ws.config_file())?;
     let store = mj_core::Store::new(ws.clone(), config);

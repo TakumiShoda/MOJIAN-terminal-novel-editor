@@ -38,6 +38,9 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
 ureq = "2"
+# epub 导出。只要 deflate，且指定用 flate2——它已经在依赖树里（ureq 的 gzip），
+# 换别的 deflate 后端等于白引一个新的压缩实现。
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # serde 非默认 feature，但快照链要把时间写进 JSON（§6.9）。
 chrono = { version = "0.4", features = ["serde"] }
 bitflags = "2"

@@ -1,7 +1,7 @@
-//! 导出与导入。见 doc.md §12.2、§11 M6。
+//! 导出与导入。见 doc.md §12.2、§11 M6/M7。
 //!
-//! `mj export <book> --format txt|md -o <out>`。epub 属 M7（要 zip + 模板 + 目录，
-//! 是另一件事），这里只做纯文本两种。
+//! `mj export <book> --format txt|md|epub -o <out>`。
+//! 文本两种在这里渲染；epub 是 zip 容器，打包在 `crate::epub`。
 //!
 //! # 为什么导出的 Markdown 要能被自己读回来
 //!
@@ -21,6 +21,8 @@ use crate::store::Store;
 pub enum Format {
     Txt,
     Md,
+    /// epub（§12.2）。二进制，走 `export_to_file`／`export_bytes`。
+    Epub,
 }
 
 impl Format {
@@ -28,6 +30,7 @@ impl Format {
         match s.to_ascii_lowercase().as_str() {
             "txt" | "text" => Some(Self::Txt),
             "md" | "markdown" => Some(Self::Md),
+            "epub" => Some(Self::Epub),
             _ => None,
         }
     }
@@ -36,8 +39,29 @@ impl Format {
         match self {
             Self::Txt => "txt",
             Self::Md => "md",
+            Self::Epub => "epub",
         }
     }
+
+    /// 文本类的那两种；epub 返回 None。
+    pub fn as_text(self) -> Option<TextFormat> {
+        match self {
+            Self::Txt => Some(TextFormat::Txt),
+            Self::Md => Some(TextFormat::Md),
+            Self::Epub => None,
+        }
+    }
+}
+
+/// 能渲染成「一篇文本」的格式。
+///
+/// 单独立一个类型，是因为 epub 根本不是一篇文本——它是按章拆成多个文件的 zip。
+/// 让 `render` 只收这个，「把 epub 渲染成 String」就从一条运行时错误路径
+/// 变成一件写不出来的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFormat {
+    Txt,
+    Md,
 }
 
 /// 一章的最小信息，供渲染。
@@ -48,16 +72,16 @@ pub struct Chapter {
 }
 
 /// 纯渲染：吃书名/作者与按顺序排好的章节，吐出整篇文本。
-pub fn render(title: &str, author: &str, chapters: &[Chapter], fmt: Format) -> String {
+pub fn render(title: &str, author: &str, chapters: &[Chapter], fmt: TextFormat) -> String {
     let mut out = String::new();
     match fmt {
-        Format::Md => {
+        TextFormat::Md => {
             out.push_str(&format!("# {title}\n\n"));
             if !author.is_empty() {
                 out.push_str(&format!("> 作者：{author}\n\n"));
             }
         }
-        Format::Txt => {
+        TextFormat::Txt => {
             out.push_str(&format!("{title}\n"));
             if !author.is_empty() {
                 out.push_str(&format!("作者：{author}\n"));
@@ -70,14 +94,14 @@ pub fn render(title: &str, author: &str, chapters: &[Chapter], fmt: Format) -> S
     for ch in chapters {
         if current_volume != Some(ch.volume.as_str()) {
             match fmt {
-                Format::Md => out.push_str(&format!("## {}\n\n", ch.volume)),
-                Format::Txt => out.push_str(&format!("{}\n\n", ch.volume)),
+                TextFormat::Md => out.push_str(&format!("## {}\n\n", ch.volume)),
+                TextFormat::Txt => out.push_str(&format!("{}\n\n", ch.volume)),
             }
             current_volume = Some(&ch.volume);
         }
         match fmt {
-            Format::Md => out.push_str(&format!("### {}\n\n", ch.title)),
-            Format::Txt => out.push_str(&format!("{}\n\n", ch.title)),
+            TextFormat::Md => out.push_str(&format!("### {}\n\n", ch.title)),
+            TextFormat::Txt => out.push_str(&format!("{}\n\n", ch.title)),
         }
         // 正文原样落地：段首的全角空格是作者排的，不该在导出时被动过。
         out.push_str(ch.body.trim_end_matches('\n'));
@@ -91,8 +115,8 @@ pub fn render(title: &str, author: &str, chapters: &[Chapter], fmt: Format) -> S
     out
 }
 
-/// 读盘 + 渲染。章节按阅读顺序（卷序 → 章序），受损章跳过。
-pub fn export(store: &Store, book: BookId, fmt: Format) -> Result<String> {
+/// 读盘：按阅读顺序（卷序 → 章序）取出全书，受损或读不出的章跳过。
+fn collect(store: &Store, book: BookId) -> Result<(Book, Vec<Chapter>)> {
     let b = store.load_book(book)?;
     let mut chapters = Vec::new();
     for vol in &b.volumes {
@@ -113,7 +137,32 @@ pub fn export(store: &Store, book: BookId, fmt: Format) -> Result<String> {
             }
         }
     }
+    Ok((b, chapters))
+}
+
+/// 读盘 + 渲染成文本。
+pub fn export(store: &Store, book: BookId, fmt: TextFormat) -> Result<String> {
+    let (b, chapters) = collect(store, book)?;
     Ok(render(&b.title, &b.author, &chapters, fmt))
+}
+
+/// 读盘 + 渲染成字节。三种格式都走得通——文本的那两种就是 UTF-8 字节。
+pub fn export_bytes(store: &Store, book: BookId, fmt: Format) -> Result<Vec<u8>> {
+    let (b, chapters) = collect(store, book)?;
+    match fmt.as_text() {
+        Some(text) => Ok(render(&b.title, &b.author, &chapters, text).into_bytes()),
+        None => {
+            // dcterms:modified 是 EPUB 3 必填项，格式固定为 UTC 的这一串。
+            let modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            crate::epub::build(
+                &b.title,
+                &b.author,
+                &format!("urn:mojian:book:{book}"),
+                &modified,
+                &chapters,
+            )
+        }
+    }
 }
 
 /// 导出到文件。
@@ -123,7 +172,7 @@ pub fn export_to_file(
     fmt: Format,
     path: &std::path::Path,
 ) -> Result<()> {
-    let text = export(store, book, fmt)?;
+    let bytes = export_bytes(store, book, fmt)?;
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
     {
@@ -132,7 +181,7 @@ pub fn export_to_file(
             source,
         })?;
     }
-    crate::atomic::write(path, text.as_bytes())
+    crate::atomic::write(path, &bytes)
 }
 
 /// 从 Markdown 解析出的书稿骨架。
@@ -287,7 +336,7 @@ mod tests {
 
     #[test]
     fn markdown_uses_heading_levels() {
-        let s = render("雪夜行", "沈砚", &chapters(), Format::Md);
+        let s = render("雪夜行", "沈砚", &chapters(), TextFormat::Md);
         assert!(s.contains("# 雪夜行"), "{s}");
         assert!(s.contains("## 第一卷"), "{s}");
         assert!(s.contains("### 第一章 雪夜"), "{s}");
@@ -297,14 +346,14 @@ mod tests {
     /// 卷标题只在换卷时出现一次，不是每章都重复一遍。
     #[test]
     fn volume_heading_appears_once_per_volume() {
-        let s = render("书", "作者", &chapters(), Format::Md);
+        let s = render("书", "作者", &chapters(), TextFormat::Md);
         assert_eq!(s.matches("## 第一卷").count(), 1, "{s}");
         assert_eq!(s.matches("## 第二卷").count(), 1, "{s}");
     }
 
     #[test]
     fn txt_has_no_markdown_marks() {
-        let s = render("雪夜行", "沈砚", &chapters(), Format::Txt);
+        let s = render("雪夜行", "沈砚", &chapters(), TextFormat::Txt);
         assert!(!s.contains('#'), "纯文本不该有井号：{s}");
         assert!(s.contains("第一章 雪夜"), "{s}");
     }
@@ -312,7 +361,7 @@ mod tests {
     /// 段首的全角空格是作者排的版，导出时不许动。
     #[test]
     fn body_indentation_is_preserved() {
-        let s = render("书", "", &chapters(), Format::Md);
+        let s = render("书", "", &chapters(), TextFormat::Md);
         assert!(
             s.contains("　　雪落了一夜。"),
             "段首全角空格应原样保留：{s}"
@@ -321,7 +370,7 @@ mod tests {
 
     #[test]
     fn empty_author_is_omitted() {
-        let s = render("书", "", &chapters(), Format::Md);
+        let s = render("书", "", &chapters(), TextFormat::Md);
         assert!(!s.contains("作者"), "{s}");
     }
 
@@ -329,7 +378,7 @@ mod tests {
 
     #[test]
     fn parses_what_we_render() {
-        let s = render("雪夜行", "沈砚", &chapters(), Format::Md);
+        let s = render("雪夜行", "沈砚", &chapters(), TextFormat::Md);
         let p = parse_markdown(&s);
         assert_eq!(p.title, "雪夜行");
         assert_eq!(p.author, "沈砚");
@@ -345,7 +394,7 @@ mod tests {
     /// 用户把稿子拿出去改完就再也收不回来了。
     #[test]
     fn markdown_roundtrips() {
-        let first = render("雪夜行", "沈砚", &chapters(), Format::Md);
+        let first = render("雪夜行", "沈砚", &chapters(), TextFormat::Md);
         let parsed = parse_markdown(&first);
         let again: Vec<Chapter> = parsed
             .chapters
@@ -356,7 +405,7 @@ mod tests {
                 body: b.clone(),
             })
             .collect();
-        let second = render(&parsed.title, &parsed.author, &again, Format::Md);
+        let second = render(&parsed.title, &parsed.author, &again, TextFormat::Md);
         assert_eq!(first, second, "导出→导入→导出 应当稳定");
     }
 
@@ -373,6 +422,15 @@ mod tests {
         assert_eq!(Format::parse("md"), Some(Format::Md));
         assert_eq!(Format::parse("Markdown"), Some(Format::Md));
         assert_eq!(Format::parse("TXT"), Some(Format::Txt));
-        assert_eq!(Format::parse("epub"), None, "epub 属 M7，这里不该假装支持");
+        assert_eq!(Format::parse("epub"), Some(Format::Epub));
+        assert_eq!(Format::parse("docx"), None, "不认识的格式要如实说不认识");
+    }
+
+    /// epub 不是「一篇文本」，从类型上就该渲染不出来。
+    #[test]
+    fn epub_is_not_a_text_format() {
+        assert_eq!(Format::Epub.as_text(), None);
+        assert_eq!(Format::Md.as_text(), Some(TextFormat::Md));
+        assert_eq!(Format::Txt.as_text(), Some(TextFormat::Txt));
     }
 }

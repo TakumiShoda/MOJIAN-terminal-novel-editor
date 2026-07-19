@@ -26,6 +26,8 @@ anyhow.workspace = true
 tracing.workspace = true
 directories.workspace = true
 chrono.workspace = true
+# epub 导出（§12.2）。epub 就是个规定了目录结构的 zip。
+zip.workspace = true
 
 # 单实例锁需要探测陈旧锁的持有者是否还活着（src/lock.rs）。
 [target.'cfg(unix)'.dependencies]
@@ -36,6 +38,8 @@ windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# 集成测试要把导出的 epub 当 zip 读回来。
+zip.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 

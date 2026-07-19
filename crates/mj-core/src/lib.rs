@@ -5,6 +5,7 @@ pub mod atomic;
 pub mod chapter_file;
 pub mod config;
 pub mod diff;
+pub mod epub;
 pub mod error;
 pub mod export;
 pub mod history;
