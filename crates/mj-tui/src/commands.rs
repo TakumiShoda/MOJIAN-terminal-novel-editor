@@ -16,6 +16,7 @@ pub enum Command {
     Snapshot,
     NewChapter,
     BackToShelf,
+    Export,
     Quit,
     // 编辑
     Undo,
@@ -47,6 +48,7 @@ impl Command {
             Self::Snapshot => "snapshot",
             Self::NewChapter => "new_chapter",
             Self::BackToShelf => "back_to_shelf",
+            Self::Export => "export",
             Self::Quit => "quit",
             Self::Undo => "undo",
             Self::Redo => "redo",
@@ -70,7 +72,7 @@ impl Command {
     /// `Esc` 那种上下文相关的键不算：它在浮层里是「关掉这层」、在正文里是
     /// 「取消选区」、在树里才是「回书架」。登记成全局键会把前两者吃掉。
     pub fn has_global_key(self) -> bool {
-        !matches!(self, Self::BackToShelf)
+        !matches!(self, Self::BackToShelf | Self::Export)
     }
 
     /// 按 id 找命令。
@@ -169,6 +171,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "回书架",
         desc: "关掉当前书，回到书架",
         keys: "Esc",
+        category: Category::File,
+    },
+    CommandSpec {
+        cmd: Command::Export,
+        name: "导出全书",
+        desc: "把整本书导出成 Markdown，存到工作区根目录",
+        keys: "",
         category: Category::File,
     },
     CommandSpec {

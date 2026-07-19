@@ -1397,6 +1397,7 @@ impl App {
                 Ok(())
             }
             Command::Appearance => self.open_settings(),
+            Command::Export => self.export_book(),
             Command::FocusMode => {
                 self.focus_mode = !self.focus_mode;
                 if let Screen::Workspace(ws) = &mut self.screen {
@@ -1588,6 +1589,28 @@ impl App {
             ws.focus = Focus::Editor;
         }
         self.toast = Some("已新建「新章」".into());
+        Ok(())
+    }
+
+    /// 导出全书为 Markdown（§12.2）。
+    ///
+    /// 路径不问用户：输入浮层（§7.1 的 `Input`）还没做，而「导出到哪」这种事
+    /// 给个确定的默认位置再把路径**告诉他**，比弹一个填路径的框更省事。
+    /// 想要别的位置和格式，`mj export` 有完整参数。
+    fn export_book(&mut self) -> anyhow::Result<()> {
+        // 先保存，免得导出的是磁盘上的旧版本（§0 禁令 1 的精神）。
+        self.save_current()?;
+        let Screen::Workspace(ws) = &self.screen else {
+            self.toast = Some("先打开一本书".into());
+            return Ok(());
+        };
+        let (id, title) = (ws.book.id, ws.book.title.clone());
+        let name = format!("{}.md", mj_core::slug::slugify(&title));
+        let path = self.store.workspace().root().join(&name);
+        match mj_core::export::export_to_file(&self.store, id, mj_core::export::Format::Md, &path) {
+            Ok(()) => self.toast = Some(format!("已导出到 {}", path.display())),
+            Err(e) => self.toast = Some(format!("导出失败：{e}")),
+        }
         Ok(())
     }
 

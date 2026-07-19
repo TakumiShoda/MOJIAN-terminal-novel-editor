@@ -6,6 +6,7 @@ pub mod chapter_file;
 pub mod config;
 pub mod diff;
 pub mod error;
+pub mod export;
 pub mod history;
 pub mod id;
 pub mod index;

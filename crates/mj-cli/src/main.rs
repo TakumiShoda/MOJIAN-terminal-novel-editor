@@ -34,13 +34,21 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// 导出
+    /// 导出（epub 属 M7，暂只支持 txt / md）
     Export {
+        /// 书 id 或书名
         book: String,
         #[arg(long, value_parser = ["txt", "md", "epub"])]
         format: String,
         #[arg(short, long)]
         out: std::path::PathBuf,
+    },
+    /// 从 Markdown 导入成一本新书（`#` 书名 / `##` 卷 / `###` 章）
+    Import {
+        file: std::path::PathBuf,
+        /// 文件里没有 `# 书名` 时用它
+        #[arg(long, default_value = "导入的书")]
+        title: String,
     },
     /// 版本历史
     History {
@@ -83,6 +91,8 @@ fn main() -> anyhow::Result<()> {
             action: ConfigAction::Check,
         }) => config_check(&ws),
         Some(Command::Doctor) => doctor(&ws),
+        Some(Command::Export { book, format, out }) => export(&ws, &book, &format, &out),
+        Some(Command::Import { file, title }) => import(&ws, &file, &title),
         Some(_) => {
             eprintln!("mj: 该子命令尚未实现（见 doc.md §11 里程碑）。");
             std::process::exit(1);
@@ -102,6 +112,52 @@ fn run_tui(ws: &Workspace) -> anyhow::Result<()> {
 
     let store = mj_core::Store::new(ws.clone(), config.clone());
     mj_tui::app::run(store, config)
+}
+
+/// `mj export`（doc.md §12.2）。
+fn export(ws: &Workspace, book: &str, format: &str, out: &std::path::Path) -> anyhow::Result<()> {
+    let Some(fmt) = mj_core::export::Format::parse(format) else {
+        // epub 在 clap 的取值表里（§12.2 就是这么列的），但它属 M7。
+        // 与其导出一个空壳 epub，不如说清楚还没有。
+        anyhow::bail!("暂不支持 {format} 格式（epub 属 M7）；可用 txt 或 md");
+    };
+    let config = Config::load(&ws.config_file())?;
+    let store = mj_core::Store::new(ws.clone(), config);
+    let b = mj_core::export::resolve_book(&store, book)?;
+    mj_core::export::export_to_file(&store, b.id, fmt, out)?;
+
+    let words: u64 = b
+        .volumes
+        .iter()
+        .flat_map(|v| &v.chapters)
+        .filter_map(|c| c.word_count)
+        .sum();
+    println!(
+        "已导出《{}》（{} 卷 {} 章，约 {} 字）→ {}",
+        b.title,
+        b.volumes.len(),
+        b.chapter_count(),
+        words,
+        out.display()
+    );
+    Ok(())
+}
+
+/// `mj import`：从 Markdown 建一本新书。
+fn import(ws: &Workspace, file: &std::path::Path, title: &str) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("读不了 {}：{e}", file.display()))?;
+    let config = Config::load(&ws.config_file())?;
+    let mut store = mj_core::Store::new(ws.clone(), config);
+    let id = mj_core::export::import_markdown(&mut store, &text, title)?;
+    let b = store.load_book(id)?;
+    println!(
+        "已导入《{}》（{} 卷 {} 章）",
+        b.title,
+        b.volumes.len(),
+        b.chapter_count()
+    );
+    Ok(())
 }
 
 /// `mj doctor`：探测终端能力并打印报告（doc.md §12.2）。
