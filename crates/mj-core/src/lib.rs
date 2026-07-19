@@ -12,6 +12,7 @@ pub mod id;
 pub mod index;
 pub mod lock;
 pub mod model;
+pub mod proof_external;
 pub mod proofing;
 pub mod slug;
 pub mod store;

@@ -110,15 +110,28 @@ pub fn ignore_key(text: &str, issue: &Issue) -> String {
     s
 }
 
-/// 一章的校对器：跑本地规则，滤掉已忽略项。
+/// 一趟校对的产物。
+///
+/// 带一条 `warning`：外部后端可能超时/退出码非零/吐了非法 JSON，
+/// §6.8 要求「记日志 + UI 提示」但**绝不影响编辑**——故它与问题列表并列，
+/// 而不是把整趟校对变成 Err。
+#[derive(Debug, Default)]
+pub struct ChapterProof {
+    pub issues: Vec<Issue>,
+    pub warning: Option<String>,
+}
+
+/// 一章的校对器：跑本地规则（可选再跑外部命令），滤掉已忽略项。
 pub struct Proofer {
     reader: RuleProofreader,
+    external: crate::proof_external::ExternalProofreader,
 }
 
 impl Proofer {
     pub fn new(confusion: ConfusionSet, opts: ProofOptions) -> Self {
         Self {
             reader: RuleProofreader::new(confusion, opts),
+            external: crate::proof_external::ExternalProofreader::new(Default::default()),
         }
     }
 
@@ -135,23 +148,41 @@ impl Proofer {
                 tracing::warn!(path = %path.display(), error = %e, "读用户混淆集失败，仅用内置集")
             }
         }
-        Self::new(confusion, config.proof.to_options())
+        let mut p = Self::new(confusion, config.proof.to_options());
+        p.external = crate::proof_external::ExternalProofreader::new(config.proof.external.clone());
+        p
     }
 
     /// 校对整章正文。已忽略的问题被滤掉（§6.8）。
+    ///
+    /// 本地规则先跑；外部后端开着才跑，且它**再慢再坏也不会让这趟失败**——
+    /// 拿不到就是没有额外的问题，附一句提示（§6.8「绝不影响编辑」）。
     pub fn check_chapter(
         &self,
         text: &str,
         ctx: &ProofContext,
         ignore: &IgnoreSet,
         cancel: &CancelToken,
-    ) -> mj_text::proof::Result<Vec<Issue>> {
+    ) -> mj_text::proof::Result<ChapterProof> {
         let paras = split_paragraphs(text);
-        let issues = self.reader.check(&paras, ctx, cancel)?;
-        Ok(issues
-            .into_iter()
-            .filter(|i| !ignore.contains(&ignore_key(text, i)))
-            .collect())
+        let mut issues = self.reader.check(&paras, ctx, cancel)?;
+
+        let mut warning = None;
+        if self.external.is_enabled() && !cancel.is_cancelled() {
+            let out = self.external.check(&paras);
+            issues.extend(out.issues);
+            warning = out.warning;
+        }
+
+        // 排好序再交出去：UI 按位置列，两个后端的结果要混在同一条线上。
+        issues.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then(a.range.end.cmp(&b.range.end))
+        });
+        issues.retain(|i| !ignore.contains(&ignore_key(text, i)));
+        Ok(ChapterProof { issues, warning })
     }
 }
 

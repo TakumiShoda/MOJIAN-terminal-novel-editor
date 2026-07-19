@@ -142,8 +142,41 @@ pub struct Proof {
     pub short_burst: bool,
     /// 低于此置信度的问题 UI 默认折叠（§12.3：的地得 <0.6 折叠）。
     pub fold_below: f32,
+    /// 外部校对命令（§6.8 的 ExternalProofreader，默认关）。
+    #[serde(default)]
+    pub external: ExternalProof,
     #[serde(flatten)]
     pub extra: toml::Table,
+}
+
+/// 外部校对后端配置（§6.8）。
+///
+/// 默认关且命令为空——这东西会**在用户机器上起进程**，不能因为装了个软件
+/// 就默认去跑点什么。必须由用户显式写出要跑的命令。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalProof {
+    pub enabled: bool,
+    /// 要跑的命令，如 `["python", "-m", "pycorrector_server"]`。
+    pub command: Vec<String>,
+    /// 超时毫秒数（§6.8 默认 30s）。
+    pub timeout_ms: u64,
+    /// 送给外部程序的语言标记。
+    pub lang: String,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl Default for ExternalProof {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: Vec::new(),
+            timeout_ms: 30_000,
+            lang: "zh".into(),
+            extra: toml::Table::new(),
+        }
+    }
 }
 
 impl Default for Proof {
@@ -160,6 +193,7 @@ impl Default for Proof {
             word_repeat: false,
             short_burst: false,
             fold_below: 0.6,
+            external: ExternalProof::default(),
             extra: toml::Table::new(),
         }
     }

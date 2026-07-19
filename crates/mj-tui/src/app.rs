@@ -1948,21 +1948,23 @@ impl App {
             self.ignore
                 .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path))
         };
-        let issues = proofer
+        let result = proofer
             .check_chapter(&text, &ctx, ignore, &mj_text::proof::CancelToken::new())
             .unwrap_or_default();
 
         let fold = self.config.proof.fold_below;
-        let n = issues.len();
+        let n = result.issues.len();
+        let warning = result.warning.clone();
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.proof_issues = issues.clone();
+            ws.proof_issues = result.issues.clone();
             ws.modals
-                .push(Modal::Proof(Box::new(ProofPanel::new(issues, fold))));
+                .push(Modal::Proof(Box::new(ProofPanel::new(result.issues, fold))));
         }
-        self.toast = Some(if n == 0 {
-            "校对完成：未发现问题".into()
-        } else {
-            format!("校对完成：{n} 处待看")
+        // 外部后端出了岔子要说一声，但校对本身照常完成（§6.8「绝不影响编辑」）。
+        self.toast = Some(match warning {
+            Some(w) => format!("校对完成：{n} 处待看（外部后端：{w}）"),
+            None if n == 0 => "校对完成：未发现问题".into(),
+            None => format!("校对完成：{n} 处待看"),
         });
         Ok(())
     }
@@ -2098,14 +2100,14 @@ impl App {
         let ignore = self
             .ignore
             .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path));
-        let issues = proofer
+        let result = proofer
             .check_chapter(&text, &ctx, ignore, &mj_text::proof::CancelToken::new())
             .unwrap_or_default();
         let fold = self.config.proof.fold_below;
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.proof_issues = issues.clone();
+            ws.proof_issues = result.issues.clone();
             ws.modals
-                .push(Modal::Proof(Box::new(ProofPanel::new(issues, fold))));
+                .push(Modal::Proof(Box::new(ProofPanel::new(result.issues, fold))));
         }
     }
 

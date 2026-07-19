@@ -180,6 +180,64 @@ fn proof_panel_and_underlines_render_across_widths() {
     }
 }
 
+/// 外部后端的问题要真的出现在 F7 面板里（§6.8 的 ExternalProofreader）。
+///
+/// 用 `sh` 假装一个外部校对程序，故只在 unix 上跑；契约解析与偏移映射的
+/// 平台无关部分由 mj-core 的单测覆盖。
+#[cfg(unix)]
+#[test]
+fn external_backend_issues_reach_the_panel() {
+    let f = setup("现场气氛好得很。\n");
+    let ws = Workspace::resolve(Some(f.dir.path().to_path_buf())).unwrap();
+    // 让外部程序在第 0 段的第 0..2 个**字符**上报一处问题。
+    let script = r#"cat >/dev/null; printf '{"v":1,"issues":[{"para":0,"start":0,"end":2,"category":"Grammar","message":"外部报的问题","suggestions":[],"confidence":0.7}]}'"#;
+    std::fs::write(
+        ws.config_file(),
+        format!(
+            "[proof.external]\nenabled = true\ncommand = [\"sh\", \"-c\", \"{}\"]\n",
+            script.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+    )
+    .unwrap();
+
+    let config = Config::load(&ws.config_file()).unwrap();
+    let store = Store::new(ws, config.clone());
+    let mut app = App::new(store, config).unwrap();
+    app.open_first_book_for_demo().unwrap();
+    app.open_chapter_for_test(f.ch).unwrap();
+
+    app.press_for_test(KeyCode::F(7), NONE).unwrap();
+    let n = app.proof_visible_for_test().unwrap();
+    assert!(n >= 1, "外部后端报的问题应出现在面板里，实际 {n} 条");
+}
+
+/// 外部后端坏掉时，校对照常完成、只多一句提示（§6.8「绝不影响编辑」）。
+#[cfg(unix)]
+#[test]
+fn broken_external_backend_does_not_break_proofing() {
+    let f = setup("现场气氛如火如茶。\n");
+    let ws = Workspace::resolve(Some(f.dir.path().to_path_buf())).unwrap();
+    std::fs::write(
+        ws.config_file(),
+        "[proof.external]\nenabled = true\ncommand = [\"sh\", \"-c\", \"exit 7\"]\n",
+    )
+    .unwrap();
+
+    let config = Config::load(&ws.config_file()).unwrap();
+    let store = Store::new(ws, config.clone());
+    let mut app = App::new(store, config).unwrap();
+    app.open_first_book_for_demo().unwrap();
+    app.open_chapter_for_test(f.ch).unwrap();
+
+    app.press_for_test(KeyCode::F(7), NONE).unwrap();
+    // 本地规则的那条错别字照样报出来。
+    assert_eq!(
+        app.proof_visible_for_test(),
+        Some(1),
+        "外部后端挂了，本地规则的结果不该跟着没"
+    );
+}
+
 /// Esc 关闭面板。
 #[test]
 fn esc_closes_panel() {

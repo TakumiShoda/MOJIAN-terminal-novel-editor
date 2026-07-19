@@ -162,7 +162,7 @@ fn proofer_flags_name_typo_using_character_names() {
         )
         .unwrap();
     assert!(
-        issues.iter().any(|i| i.rule_id == "name.suspect"),
+        issues.issues.iter().any(|i| i.rule_id == "name.suspect"),
         "应根据角色名「沈砚」把「沈研」标为可疑：{issues:?}"
     );
 }
@@ -185,6 +185,7 @@ fn ignored_issue_is_filtered_out() {
         )
         .unwrap();
     let typo = first
+        .issues
         .iter()
         .find(|i| i.rule_id == "typo.confusion")
         .unwrap();
@@ -196,7 +197,7 @@ fn ignored_issue_is_filtered_out() {
         .check_chapter(text, &ProofContext::default(), &ignore, &CancelToken::new())
         .unwrap();
     assert!(
-        !second.iter().any(|i| i.rule_id == "typo.confusion"),
+        !second.issues.iter().any(|i| i.rule_id == "typo.confusion"),
         "已忽略的问题不该再出现：{second:?}"
     );
 }
@@ -258,6 +259,7 @@ fn user_confusion_overrides_builtin() {
         .unwrap();
     assert!(
         issues
+            .issues
             .iter()
             .any(|i| i.suggestions == vec!["正确词".to_string()]),
         "用户混淆集条目应生效：{issues:?}"
