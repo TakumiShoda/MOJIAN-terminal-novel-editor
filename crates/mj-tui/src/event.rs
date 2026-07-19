@@ -8,18 +8,32 @@ use std::time::Duration;
 
 use ratatui::crossterm::event::Event;
 
-/// M0 只有终端事件与 tick。Proof / Index / Font 等工作线程回传见后续里程碑。
 #[derive(Debug)]
 pub enum AppEvent {
     Term(Event),
     /// 100ms，驱动自动保存计时与动画。
     Tick,
+    /// 模型校对跑完了，工作线程回传（§6.8、§7「长任务一律进工作线程」）。
+    LlmProof(Box<LlmProofDone>),
+}
+
+/// 一趟模型校对的结果。
+///
+/// `chapter` + `text_hash` 是**指纹**，不是附赠信息：请求要跑好几秒，这期间用户
+/// 完全可能改了正文或换了章，而 `issues` 里的是当时那份文本的字节偏移。指纹对不上
+/// 就必须整份丢掉——拿旧坐标往新正文上画，下划线会落在毫不相干的字上。
+#[derive(Debug)]
+pub struct LlmProofDone {
+    pub chapter: mj_core::id::ChapterId,
+    pub text_hash: String,
+    pub issues: Vec<mj_text::proof::Issue>,
+    pub warning: Option<String>,
 }
 
 pub struct EventLoop {
     rx: Receiver<AppEvent>,
     /// 持有 sender 让 channel 保持存活，即使采集线程意外退出。
-    _tx: Sender<AppEvent>,
+    tx: Sender<AppEvent>,
 }
 
 impl EventLoop {
@@ -66,7 +80,12 @@ impl EventLoop {
             })
             .ok();
 
-        Self { rx, _tx: tx }
+        Self { rx, tx }
+    }
+
+    /// 给工作线程用的回传端。
+    pub fn sender(&self) -> Sender<AppEvent> {
+        self.tx.clone()
     }
 
     /// 取下一个事件，阻塞直到有事件到达。

@@ -123,8 +123,11 @@ mod tests {
         for c in "校对".chars() {
             p.input_char(c);
         }
-        assert_eq!(p.match_count(), 1);
-        assert_eq!(p.selected(), Some(Command::Proof));
+        // 不写死条数：往命令表里加一条带「校对」的命令就会把它撞坏，
+        // 而这个用例要验的是「筛选起作用」，不是「校对恰好只有一条」。
+        assert!(p.match_count() >= 1);
+        assert!(p.match_count() < COMMANDS.len(), "该筛掉一部分");
+        assert_eq!(p.selected(), Some(Command::Proof), "表里靠前的先出");
     }
 
     /// 敲键位也能找到命令。
@@ -167,10 +170,12 @@ mod tests {
         for c in "校对".chars() {
             p.input_char(c);
         }
+        let n = p.match_count();
+        assert!(n > 0);
         for _ in 0..20 {
             p.move_down();
         }
-        assert_eq!(p.cursor(), 0, "只有一条候选，光标不越界");
+        assert_eq!(p.cursor(), n - 1, "光标该停在最后一条，不越界");
     }
 
     #[test]

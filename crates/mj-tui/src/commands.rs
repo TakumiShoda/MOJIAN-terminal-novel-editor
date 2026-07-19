@@ -29,6 +29,7 @@ pub enum Command {
     UndoBatch,
     // 工具
     Proof,
+    ProofLlm,
     History,
     Characters,
     Stats,
@@ -61,6 +62,7 @@ impl Command {
             Self::Format => "format",
             Self::UndoBatch => "undo_batch",
             Self::Proof => "proof",
+            Self::ProofLlm => "proof_llm",
             Self::History => "history",
             Self::Characters => "characters",
             Self::Stats => "stats",
@@ -254,6 +256,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "校对当前章",
         desc: "查错别字、标点、文风、专名一致性",
         keys: "F7",
+        category: Category::Tools,
+    },
+    CommandSpec {
+        cmd: Command::ProofLlm,
+        name: "模型校对当前章",
+        desc: "把当前章发给大模型查病句（默认关，需先在配置里开启并同意）",
+        keys: "",
         category: Category::Tools,
     },
     CommandSpec {

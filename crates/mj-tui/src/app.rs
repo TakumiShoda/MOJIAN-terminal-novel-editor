@@ -20,12 +20,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::batch::{BatchJob, BatchKind, BatchUndo, Scope};
 use crate::commands::Command;
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
-use crate::event::{AppEvent, EventLoop};
+use crate::event::{AppEvent, EventLoop, LlmProofDone};
 use crate::screens::character_form::CharacterForm;
 use crate::screens::character_panel::CharacterPanel;
 use crate::screens::command_palette::CommandPalette;
 use crate::screens::completion::Completion;
 use crate::screens::confirm::Confirm;
+use crate::screens::consent::Consent;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::help::{self, Help};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
@@ -138,6 +139,18 @@ pub struct App {
     focus_mode: bool,
     /// 键位表（§7.3 [MUST] 可重绑定）。启动时由 config 的 [keymap] 构建。
     keymap: crate::keymap::Keymap,
+    /// 正在跑的模型校对（§6.8）。同时只允许一趟——那是要花钱的请求，
+    /// 连按两下命令不该变成两趟。
+    llm_job: Option<LlmJob>,
+    /// 工作线程的回传端。`App::new` 时还没有事件循环，故由 `run_loop` 装上。
+    events_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
+}
+
+/// 在跑的那趟模型校对。
+struct LlmJob {
+    /// Esc 用它掐掉（§7：长任务要能取消）。
+    cancel: mj_text::proof::CancelToken,
+    chapter: ChapterId,
 }
 
 impl App {
@@ -181,6 +194,8 @@ impl App {
             theme,
             focus_mode: false,
             keymap,
+            llm_job: None,
+            events_tx: None,
         })
     }
 
@@ -300,6 +315,8 @@ impl App {
         term: &mut DefaultTerminal,
         events: &EventLoop,
     ) -> anyhow::Result<()> {
+        // 工作线程要有路把结果送回来（§7）。
+        self.events_tx = Some(events.sender());
         while !self.should_quit {
             if self.dirty {
                 term.draw(|f| self.render(f))?;
@@ -330,6 +347,10 @@ impl App {
                 AppEvent::Term(_) => {}
                 // 自动保存的心跳（§7.4：Tick 驱动自动保存计时）。
                 AppEvent::Tick => self.on_tick()?,
+                AppEvent::LlmProof(done) => {
+                    self.on_llm_proof_done(*done);
+                    self.dirty = true;
+                }
             }
         }
         Ok(())
@@ -341,6 +362,16 @@ impl App {
         // Ctrl+C 任何时候都退出。
         if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
+            return Ok(());
+        }
+
+        // 模型校对在飞的时候，Esc 就是「掐掉它」——弹出的提示是这么许诺的（§7）。
+        // 掐完 Esc 恢复原义（关浮层 / 取消选区 / 回书架）。
+        if code == KeyCode::Esc
+            && let Some(job) = self.llm_job.take()
+        {
+            job.cancel.cancel();
+            self.toast = Some("已取消模型校对".into());
             return Ok(());
         }
 
@@ -428,6 +459,7 @@ impl App {
         if let Some(kind) = top {
             return match kind {
                 ModalKind::Confirm => self.on_key_confirm(code),
+                ModalKind::Consent => self.on_key_consent(code),
                 ModalKind::Diff => self.on_key_diff(code),
                 ModalKind::History => self.on_key_history(code),
                 ModalKind::Search => self.on_key_search(code, mods),
@@ -1382,6 +1414,7 @@ impl App {
             Command::Format => self.open_format_preview(),
             Command::UndoBatch => self.undo_batch(),
             Command::Proof => self.open_proof(),
+            Command::ProofLlm => self.start_llm_proof(),
             Command::History => self.open_history(),
             Command::Characters => self.open_characters(),
             Command::Stats => {
@@ -1967,6 +2000,203 @@ impl App {
             None => format!("校对完成：{n} 处待看"),
         });
         Ok(())
+    }
+
+    // ---- 模型校对（§6.8 第 3 条）----
+
+    /// 正文指纹。工作线程回来时用它判断结果还作不作数。
+    ///
+    /// 借 mj-core 的哈希而不在这里算：§4 分层里 blake3 只归 mj-core。
+    fn text_fingerprint(text: &str) -> String {
+        mj_core::index::content_hash(text)
+    }
+
+    /// 「模型校对当前章」。§6.8 `[MUST]` 只手动触发，不做全书自动扫描。
+    ///
+    /// 三道闸：没开就说怎么开、开了没同意就先弹同意框、都齐了才发。
+    fn start_llm_proof(&mut self) -> anyhow::Result<()> {
+        if self.llm_job.is_some() {
+            self.toast = Some("模型校对正在跑，Esc 可取消".into());
+            return Ok(());
+        }
+        let cfg = &self.config.proof.llm;
+        if !cfg.enabled {
+            self.toast =
+                Some("模型校对没开。在 config.toml 里设 [proof.llm] enabled = true".into());
+            return Ok(());
+        }
+        // §6.8 [MUST]：首次开启必须弹说明并获得明确同意。
+        if !cfg.consented {
+            let c = Consent::new(
+                cfg.endpoint.clone(),
+                cfg.model.clone(),
+                cfg.api_key_env.clone(),
+            );
+            if let Screen::Workspace(ws) = &mut self.screen {
+                ws.modals.push(Modal::Consent(Box::new(c)));
+            }
+            return Ok(());
+        }
+        self.spawn_llm_proof()
+    }
+
+    /// 真的把请求发出去。调用前必须已确认 enabled + consented。
+    fn spawn_llm_proof(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let Some(open) = &ws.editor else {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        };
+        let (book, chapter, text) = (ws.book.id, open.id, open.buffer.contents());
+
+        let proofer =
+            mj_core::proofing::Proofer::from_workspace(self.store.workspace(), &self.config);
+        // 配齐没有（密钥、环境变量、明文密钥），在发之前问清楚。
+        if let Some(problem) = proofer.llm_setup_problem() {
+            self.toast = Some(problem);
+            return Ok(());
+        }
+        let Some(tx) = self.events_tx.clone() else {
+            // 只有测试里的 App 没接事件循环。
+            self.toast = Some("事件循环未就绪".into());
+            return Ok(());
+        };
+
+        let ctx = mj_core::proofing::build_context(&self.store, self.store.workspace(), book)
+            .unwrap_or_default();
+        let ignore = {
+            let path = self.store.workspace().ignore_file();
+            self.ignore
+                .get_or_insert_with(|| mj_core::proofing::IgnoreSet::load(&path))
+                .clone()
+        };
+        let cancel = mj_text::proof::CancelToken::new();
+        let text_hash = Self::text_fingerprint(&text);
+
+        let worker_cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("mj-llm-proof".into())
+            .spawn(move || {
+                let out = proofer.check_chapter_llm(&text, &ctx, &ignore, &worker_cancel);
+                // 送不回去说明主循环已经退了，丢掉即可。
+                let _ = tx.send(AppEvent::LlmProof(Box::new(LlmProofDone {
+                    chapter,
+                    text_hash,
+                    issues: out.issues,
+                    warning: out.warning,
+                })));
+            })?;
+
+        self.llm_job = Some(LlmJob { cancel, chapter });
+        self.toast = Some("正在请求模型校对……（Esc 取消）".into());
+        Ok(())
+    }
+
+    /// 工作线程回来了。
+    ///
+    /// **先验指纹再用**：请求跑了好几秒，这期间用户可能改了正文或换了章，而
+    /// `issues` 里是当时那份文本的字节偏移。对不上就整份丢掉——拿旧坐标往新正文
+    /// 上画，下划线会落在毫不相干的字上，比不显示更糟。
+    fn on_llm_proof_done(&mut self, done: LlmProofDone) {
+        let job = self.llm_job.take();
+        if job.is_none_or(|j| j.chapter != done.chapter) {
+            return; // 已取消，或早就换了章
+        }
+        let Screen::Workspace(ws) = &self.screen else {
+            return;
+        };
+        let Some(open) = &ws.editor else { return };
+        if open.id != done.chapter
+            || Self::text_fingerprint(&open.buffer.contents()) != done.text_hash
+        {
+            self.toast = Some("正文已改动，模型校对结果作废，请重跑".into());
+            return;
+        }
+
+        let n = done.issues.len();
+        let fold = self.config.proof.fold_below;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            // 并进本地规则那一趟的结果，按位置排好——UI 是按位置列的。
+            ws.proof_issues.extend(done.issues);
+            ws.proof_issues.sort_by(|a, b| {
+                a.range
+                    .start
+                    .cmp(&b.range.start)
+                    .then(a.range.end.cmp(&b.range.end))
+            });
+            let all = ws.proof_issues.clone();
+            ws.modals.close_kind(ModalKind::Proof);
+            ws.modals
+                .push(Modal::Proof(Box::new(ProofPanel::new(all, fold))));
+        }
+        self.toast = Some(match done.warning {
+            Some(w) => format!("模型校对：新增 {n} 处（{w}）"),
+            None if n == 0 => "模型校对：未发现问题".into(),
+            None => format!("模型校对：新增 {n} 处"),
+        });
+    }
+
+    /// 同意框上的按键。默认停在「不同意」。
+    fn on_key_consent(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        let confirmed = match code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.modals.take_consent();
+                }
+                self.toast = Some("已取消，正文没有发出去".into());
+                return Ok(());
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => true,
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                if let Screen::Workspace(ws) = &mut self.screen
+                    && let Some(Modal::Consent(c)) = ws.modals.top_mut()
+                {
+                    c.toggle();
+                }
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let yes = matches!(self.screen_modal_consent(), Some(true));
+                if !yes {
+                    if let Screen::Workspace(ws) = &mut self.screen {
+                        ws.modals.take_consent();
+                    }
+                    self.toast = Some("已取消，正文没有发出去".into());
+                    return Ok(());
+                }
+                true
+            }
+            _ => return Ok(()),
+        };
+        if !confirmed {
+            return Ok(());
+        }
+
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.modals.take_consent();
+        }
+        // 记下来，下次不再问。写不进去也照跑这一趟——但要说一声，
+        // 否则用户每次都被问一遍还不知道为什么。
+        self.config.proof.llm.consented = true;
+        let path = self.store.workspace().config_file();
+        if let Err(e) = self.config.save(&path) {
+            tracing::warn!(error = %e, "写不回 consented");
+            self.toast = Some(format!("已同意，但写不回配置（{e}），下次还会再问"));
+        }
+        self.spawn_llm_proof()
+    }
+
+    /// 同意框当前停在哪个按钮。
+    fn screen_modal_consent(&self) -> Option<bool> {
+        match &self.screen {
+            Screen::Workspace(ws) => match ws.modals.top() {
+                Some(Modal::Consent(c)) => Some(c.is_yes()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn on_key_proof(&mut self, code: KeyCode) -> anyhow::Result<()> {
@@ -2809,6 +3039,13 @@ impl App {
         }
     }
 
+    /// 供测试：跑一条命令。没有专属键位的命令（如模型校对）只能这样触发。
+    #[doc(hidden)]
+    pub fn run_command_for_test(&mut self, cmd: Command) -> anyhow::Result<()> {
+        self.toast = None;
+        self.run_command(cmd)
+    }
+
     /// 供测试：@ 补全是否激活。
     #[doc(hidden)]
     pub fn completion_active_for_test(&self) -> bool {
@@ -3009,6 +3246,7 @@ impl App {
                         Modal::CharacterForm(fm) => render_character_form(frame, body, fm, theme),
                         Modal::Characters(p) => render_characters(frame, body, p, theme),
                         Modal::Confirm(c) => render_confirm(frame, body, c, theme),
+                        Modal::Consent(c) => render_consent(frame, body, c, theme),
                         Modal::Palette(p) => render_palette(frame, body, p, theme),
                         Modal::Help(h) => render_help(frame, body, h, theme, keymap),
                         Modal::Settings(s) => render_settings(frame, body, s, theme),
@@ -3647,6 +3885,66 @@ fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob, theme: &
 }
 
 /// 宽范围作业的确认框。居中浮层，盖在底下那层上。
+/// 同意框（§6.8 [MUST]）。
+///
+/// 这是唯一一个**截断即失效**的框：用户要据此决定把稿子发不发给第三方，
+/// 看不全就等于没告知。故窄屏下折行而非截断，且高度按**折行后**的行数算——
+/// 只折行不加高，内容会改从底下被切掉，一样是没看全。
+fn render_consent(frame: &mut ratatui::Frame, area: Rect, c: &Consent, theme: &Theme) {
+    use unicode_width::UnicodeWidthStr;
+    let lines = c.lines();
+    let want_w = lines
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(40)
+        .max(40) as u16
+        + 4;
+    let w = want_w.min(area.width);
+    // 折行后实际占几行：宽度不够时一行会摊成好几行。
+    let inner_w = w.saturating_sub(2).max(1) as usize;
+    let wrapped: usize = lines
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()).div_ceil(inner_w).max(1))
+        .sum();
+    let want_h = wrapped as u16 + 4;
+    let h = want_h.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", c.title()))
+        .border_style(Style::default().fg(theme.warning));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [text_area, btn_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    let body: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(
+        Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+        text_area,
+    );
+
+    let sel = Style::default()
+        .fg(theme.selection_fg)
+        .bg(theme.warning)
+        .add_modifier(Modifier::BOLD);
+    let plain = Style::default().fg(theme.dim);
+    let btns = Line::from(vec![
+        Span::styled("  不同意 (Esc)  ", if c.is_yes() { plain } else { sel }),
+        Span::raw("   "),
+        Span::styled("  同意并发送 (y)  ", if c.is_yes() { sel } else { plain }),
+    ]);
+    frame.render_widget(Paragraph::new(btns).centered(), btn_area);
+}
+
 fn render_confirm(frame: &mut ratatui::Frame, area: Rect, c: &Confirm, theme: &Theme) {
     let lines = c.lines();
     // 宽度按最长一行算（CJK 占两格），高度按行数——内容多大就多大，

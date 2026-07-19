@@ -31,6 +31,8 @@ pub enum Modal {
     History(Box<HistoryPanel>),
     Diff(Box<DiffView>),
     Confirm(Box<Confirm>),
+    /// 「正文将发送到第三方服务」的同意框（§6.8 [MUST]）。
+    Consent(Box<super::Consent>),
     Proof(Box<ProofPanel>),
     Characters(Box<CharacterPanel>),
     CharacterForm(Box<CharacterForm>),
@@ -51,6 +53,7 @@ pub enum ModalKind {
     History,
     Diff,
     Confirm,
+    Consent,
     Proof,
     Characters,
     CharacterForm,
@@ -78,6 +81,7 @@ impl Modal {
             Self::History(_) => ModalKind::History,
             Self::Diff(_) => ModalKind::Diff,
             Self::Confirm(_) => ModalKind::Confirm,
+            Self::Consent(_) => ModalKind::Consent,
             Self::Proof(_) => ModalKind::Proof,
             Self::Characters(_) => ModalKind::Characters,
             Self::CharacterForm(_) => ModalKind::CharacterForm,
@@ -180,6 +184,14 @@ impl ModalStack {
     pub fn take_confirm(&mut self) -> Option<Confirm> {
         match self.close_kind(ModalKind::Confirm)? {
             Modal::Confirm(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// 取走同意框——同意后要落盘 consented 并接着跑那趟校对。
+    pub fn take_consent(&mut self) -> Option<super::Consent> {
+        match self.close_kind(ModalKind::Consent)? {
+            Modal::Consent(c) => Some(*c),
             _ => None,
         }
     }

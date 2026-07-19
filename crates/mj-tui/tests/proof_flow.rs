@@ -155,6 +155,26 @@ fn character_name_drives_consistency_check() {
     );
 }
 
+/// 按显示宽度读屏：TestBackend 里一个 CJK 占两格，第二格是空格，
+/// 逐格拼会在每个汉字之间塞进空格，搜什么都搜不到。
+fn screen_text(app: &mut App, w: u16, h: u16) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|fr| app.render_for_test(fr)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        let mut x = 0;
+        while x < buf.area.width {
+            let s = buf[(x, y)].symbol();
+            out.push_str(s);
+            x += (UnicodeWidthStr::width(s) as u16).max(1);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn draw_ok(app: &mut App, w: u16, h: u16) -> bool {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| app.render_for_test(f)).unwrap();
@@ -236,6 +256,167 @@ fn broken_external_backend_does_not_break_proofing() {
         Some(1),
         "外部后端挂了，本地规则的结果不该跟着没"
     );
+}
+
+// ---- 模型校对的开启闸门（§6.8 第 3 条 [MUST]）----
+//
+// 这几个用例一律把 endpoint 指向 127.0.0.1:1（保留端口，连不上）。
+// 否则开发机上真设了 ANTHROPIC_API_KEY 时，跑一次测试就会往外发一次真实请求
+// ——测试不该花别人的钱。
+
+/// 用给定的 [proof.llm] 配置起一个 App。
+fn app_with_llm(f: &Fixture, extra_toml: &str) -> (Workspace, App) {
+    let ws = Workspace::resolve(Some(f.dir.path().to_path_buf())).unwrap();
+    std::fs::write(
+        ws.config_file(),
+        format!("[proof.llm]\nendpoint = \"http://127.0.0.1:1/\"\n{extra_toml}"),
+    )
+    .unwrap();
+    let config = Config::load(&ws.config_file()).unwrap();
+    let store = Store::new(
+        Workspace::resolve(Some(f.dir.path().to_path_buf())).unwrap(),
+        config.clone(),
+    );
+    let mut app = App::new(store, config).unwrap();
+    app.open_first_book_for_demo().unwrap();
+    app.open_chapter_for_test(f.ch).unwrap();
+    (ws, app)
+}
+
+fn config_text(ws: &Workspace) -> String {
+    std::fs::read_to_string(ws.config_file()).unwrap_or_default()
+}
+
+/// 没开：告诉用户怎么开，不弹框也不发请求。
+#[test]
+fn llm_off_by_default_and_says_how_to_enable() {
+    let f = setup("正文。\n");
+    let (_ws, mut app) = app_with_llm(&f, "");
+    app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+        .unwrap();
+    assert!(
+        app.modal_stack_for_test().is_empty(),
+        "没开就不该弹任何框：{:?}",
+        app.modal_stack_for_test()
+    );
+    let t = app.toast_for_test().unwrap();
+    assert!(t.contains("enabled"), "要告诉用户怎么开：{t}");
+}
+
+/// §6.8 [MUST]：开了但没同意 → 先弹说明，**不发正文**。
+#[test]
+fn enabling_without_consent_shows_the_dialog_first() {
+    let f = setup("正文。\n");
+    let (_ws, mut app) = app_with_llm(&f, "enabled = true\n");
+    app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+        .unwrap();
+    assert_eq!(
+        app.modal_stack_for_test(),
+        vec!["Consent".to_string()],
+        "开了没同意应先弹说明框"
+    );
+}
+
+/// 说明框默认停在「不同意」，Esc / n 都退出，且不写 consented。
+#[test]
+fn declining_consent_changes_nothing() {
+    for key in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Enter] {
+        let f = setup("正文。\n");
+        let (ws, mut app) = app_with_llm(&f, "enabled = true\n");
+        app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+            .unwrap();
+        app.press_for_test(key, NONE).unwrap();
+
+        assert!(
+            app.modal_stack_for_test().is_empty(),
+            "{key:?} 后说明框该关掉"
+        );
+        // Enter 走默认项——默认是「不同意」，手滑连按两下回车不该把稿子发出去。
+        assert!(
+            !config_text(&ws).contains("consented = true"),
+            "{key:?}：不同意就不该落盘 consented\n{}",
+            config_text(&ws)
+        );
+        let t = app.toast_for_test().unwrap_or("");
+        assert!(t.contains("没有发出去"), "{key:?}：要明确说没发：{t}");
+    }
+}
+
+/// 同意后要落盘，下次不再问（§6.8 说的是「首次开启」）。
+#[test]
+fn accepting_consent_persists_it() {
+    let f = setup("正文。\n");
+    let (ws, mut app) = app_with_llm(&f, "enabled = true\n");
+    app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+        .unwrap();
+    app.press_for_test(KeyCode::Char('y'), NONE).unwrap();
+
+    assert!(app.modal_stack_for_test().is_empty(), "同意后说明框该关掉");
+    assert!(
+        config_text(&ws).contains("consented = true"),
+        "同意要写回配置，否则每次都问\n{}",
+        config_text(&ws)
+    );
+    // 重开一个 App：不该再被问一遍。
+    let config = Config::load(&ws.config_file()).unwrap();
+    let store = Store::new(
+        Workspace::resolve(Some(f.dir.path().to_path_buf())).unwrap(),
+        config.clone(),
+    );
+    let mut app2 = App::new(store, config).unwrap();
+    app2.open_first_book_for_demo().unwrap();
+    app2.open_chapter_for_test(f.ch).unwrap();
+    app2.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+        .unwrap();
+    assert!(
+        !app2.modal_stack_for_test().contains(&"Consent".to_string()),
+        "同意过就不该再问"
+    );
+}
+
+/// 配置里写了明文密钥 → 拒跑并说清怎么改（§6.8 [MUST]：密钥不得明文入配置）。
+#[test]
+fn plaintext_key_in_config_is_refused() {
+    let f = setup("正文。\n");
+    let (_ws, mut app) = app_with_llm(
+        &f,
+        "enabled = true\nconsented = true\napi_key = \"sk-ant-secret\"\n",
+    );
+    app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+        .unwrap();
+    let t = app.toast_for_test().unwrap();
+    assert!(t.contains("环境变量"), "要告诉用户改用环境变量：{t}");
+    assert!(!t.contains("sk-ant-secret"), "提示里不能回显密钥：{t}");
+}
+
+/// 说明框各档宽度都不撕屏，且**关键信息一个都不能少**（§10、§6.8 [MUST]）。
+///
+/// 这是唯一一个截断即失效的框：用户要据此决定把稿子发不发出去，
+/// 窄屏下把地址切掉一半，就等于没告知。
+#[test]
+fn consent_dialog_stays_readable_across_widths() {
+    let f = setup("正文。\n");
+    for (w, h) in [(60, 24), (80, 24), (120, 30), (200, 50)] {
+        let (_ws, mut app) = app_with_llm(&f, "enabled = true\n");
+        app.run_command_for_test(mj_tui::commands::Command::ProofLlm)
+            .unwrap();
+        assert!(draw_ok(&mut app, w, h), "同意框在 {w}x{h} 撕屏了");
+
+        let text = screen_text(&mut app, w, h);
+        // 「墨简管不着」在最长那行的**末尾**——60 列下这行必须折行才留得住它，
+        // 只挑短句断言等于没测（那些行本来就不会被截）。
+        for must in [
+            "127.0.0.1",
+            "ANTHROPIC_API_KEY",
+            "不会自动扫描全书",
+            "墨简管不着",
+        ] {
+            assert!(
+                text.replace('\n', "").contains(must),
+                "{w}x{h}：说明里少了「{must}」\n{text}"
+            );
+        }
+    }
 }
 
 /// Esc 关闭面板。
