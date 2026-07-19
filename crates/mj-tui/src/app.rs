@@ -26,6 +26,7 @@ use crate::screens::completion::Completion;
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
+use crate::screens::modal::{Modal, ModalKind, ModalStack};
 use crate::screens::proof_panel::{self, ProofPanel};
 use crate::screens::search_panel::{self, SearchPanel};
 use crate::screens::shelf::{Shelf, format_words};
@@ -56,34 +57,20 @@ struct Workspace {
     focus: Focus,
     /// 侧栏是否显示（Ctrl+B 切换，§7.3）。
     show_tree: bool,
-    /// 统计面板（F3）。Some = 正在显示。
-    ///
-    /// M1/M2 尚无浮层栈（§7.1 的 `Vec<Modal>` 属 M6），故先用一个
-    /// Option 表示。M6 接入浮层栈时这里会并进去——但那不该拖着
-    /// §6.4 的 [MUST] 一起等。
-    stats: Option<Stats>,
-    /// 排版预览面板（F5，§6.5 [MUST]）。同上，M6 并入浮层栈。
-    format_preview: Option<FormatPreview>,
-    /// 查找替换面板（Ctrl+F / Ctrl+H，§6.6）。同上。
-    search: Option<SearchPanel>,
-    /// 历史面板（F8，§6.9）。同上。
-    history: Option<HistoryPanel>,
-    /// diff 视图（历史面板里 Enter 打开，§6.9）。同上。
-    diff: Option<DiffView>,
+    /// 浮层栈（§7.1 [MUST]）：统计/排版预览/查找/历史/diff/确认/校对/角色/角色表单。
+    /// 谁在栈顶谁吃键，Esc 逐层弹出。
+    modals: ModalStack,
     /// 正在跑的批量作业（全卷/全书排版或替换，§6.5/§6.6）。
+    ///
+    /// **不进浮层栈**：它不是用户可关的浮层，Esc 的语义是「中断作业」而非
+    /// 「关闭窗口」；§7.1 列的浮层里也没有它。
     batch: Option<BatchJob>,
-    /// 宽范围作业的确认框。同上，M6 并入浮层栈。
-    confirm: Option<Confirm>,
-    /// 校对面板（F7，§6.8）。同上，M6 并入浮层栈。
-    proof: Option<ProofPanel>,
     /// 最近一次校对的问题（整章坐标），供正文下划线着色（§6.8 [MUST]）。
     /// 关面板后仍留着，好让 Enter 跳过去时看得见；正文一改就清空——坐标失效了。
     proof_issues: Vec<mj_text::proof::Issue>,
-    /// 角色速查侧栏（Alt+C，§6.7）。同上，M6 并入浮层栈。
-    character: Option<CharacterPanel>,
-    /// 角色卡表单编辑（角色面板里按 e，§6.7）。同上。
-    character_form: Option<CharacterForm>,
     /// 正文里 `@` 触发的角色名补全（§6.7 [SHOULD]）。
+    ///
+    /// **不进浮层栈**：键仍然打进缓冲，它不夺焦点，只是跟随光标的候选框。
     completion: Option<Completion>,
 }
 
@@ -370,17 +357,9 @@ impl App {
             editor: None,
             focus: Focus::Tree,
             show_tree: true,
-            stats: None,
-            format_preview: None,
-            search: None,
-            history: None,
-            diff: None,
+            modals: ModalStack::default(),
             batch: None,
-            confirm: None,
-            proof: None,
             proof_issues: Vec::new(),
-            character: None,
-            character_form: None,
             completion: None,
         };
         // 打开首章，让用户直接能写——而不是对着空白发呆。
@@ -398,34 +377,27 @@ impl App {
     // ---- 工作区 ----
 
     fn on_key_workspace(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
-        // 浮层打开时它吃掉所有按键（浮层语义，§7.1）。
-        // 确认框最靠上：它是从查找面板/排版预览上叠出来的。
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.confirm.is_some()) {
-            return self.on_key_confirm(code);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.diff.is_some()) {
-            return self.on_key_diff(code);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.history.is_some()) {
-            return self.on_key_history(code);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.search.is_some()) {
-            return self.on_key_search(code, mods);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.format_preview.is_some()) {
-            return self.on_key_format_preview(code);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.proof.is_some()) {
-            return self.on_key_proof(code);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.character_form.is_some()) {
-            return self.on_key_character_form(code, mods);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.character.is_some()) {
-            return self.on_key_character(code, mods);
-        }
-        if matches!(&self.screen, Screen::Workspace(ws) if ws.stats.is_some()) {
-            return self.on_key_stats(code);
+        // 浮层：**栈顶那层**吃掉所有按键（§7.1）。
+        //
+        // 从前这里是一条手写死的优先级链（先查 confirm、再 diff、再 history……），
+        // 那实质上是把 z 序编码进了 if 的顺序——加一层就得记得插对位置。
+        // 现在顺序由栈本身决定：谁最后压进来谁在上面。
+        let top = match &self.screen {
+            Screen::Workspace(ws) => ws.modals.top_kind(),
+            _ => None,
+        };
+        if let Some(kind) = top {
+            return match kind {
+                ModalKind::Confirm => self.on_key_confirm(code),
+                ModalKind::Diff => self.on_key_diff(code),
+                ModalKind::History => self.on_key_history(code),
+                ModalKind::Search => self.on_key_search(code, mods),
+                ModalKind::FormatPreview => self.on_key_format_preview(code),
+                ModalKind::Proof => self.on_key_proof(code),
+                ModalKind::CharacterForm => self.on_key_character_form(code, mods),
+                ModalKind::Characters => self.on_key_character(code, mods),
+                ModalKind::Stats => self.on_key_stats(code),
+            };
         }
 
         // 先处理全局键。
@@ -466,7 +438,7 @@ impl App {
             // F3 空着且相邻，故取之。M6 做命令面板时会有正式入口。
             KeyCode::F(3) => {
                 if let Screen::Workspace(ws) = &mut self.screen {
-                    ws.stats = Some(Stats::new());
+                    ws.modals.push(Modal::Stats(Box::new(Stats::new())));
                 }
                 return Ok(());
             }
@@ -550,7 +522,8 @@ impl App {
             return Ok(());
         }
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.confirm = Some(Confirm::new(kind, scope, n));
+            ws.modals
+                .push(Modal::Confirm(Box::new(Confirm::new(kind, scope, n))));
         }
         Ok(())
     }
@@ -560,16 +533,18 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(c) = &mut ws.confirm else {
+        let Some(c) = ws.modals.confirm_mut() else {
             return Ok(());
         };
         match code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => c.toggle(),
-            KeyCode::Esc | KeyCode::Char('n') => ws.confirm = None,
+            KeyCode::Esc | KeyCode::Char('n') => {
+                ws.modals.close_kind(ModalKind::Confirm);
+            }
             KeyCode::Enter | KeyCode::Char('y') => {
                 // 'y' 是明示的「就是要」，不看光标停在哪。
                 let go = code == KeyCode::Char('y') || c.is_yes();
-                let Some(c) = ws.confirm.take() else {
+                let Some(c) = ws.modals.take_confirm() else {
                     return Ok(());
                 };
                 if go {
@@ -593,8 +568,8 @@ impl App {
         }
         let job = BatchJob::new(kind, scope, chapters);
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.format_preview = None;
-            ws.search = None;
+            ws.modals.close_kind(ModalKind::FormatPreview);
+            ws.modals.close_kind(ModalKind::Search);
             ws.batch = Some(job);
         }
         Ok(())
@@ -905,7 +880,8 @@ impl App {
             return Ok(());
         }
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.history = Some(HistoryPanel::new(snaps));
+            ws.modals
+                .push(Modal::History(Box::new(HistoryPanel::new(snaps))));
         }
         Ok(())
     }
@@ -923,11 +899,13 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.history else {
+        let Some(p) = ws.modals.history_mut() else {
             return Ok(());
         };
         match code {
-            KeyCode::Esc | KeyCode::F(8) | KeyCode::Char('q') => ws.history = None,
+            KeyCode::Esc | KeyCode::F(8) | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::History);
+            }
             KeyCode::Down | KeyCode::Char('j') => p.move_down(),
             KeyCode::Up | KeyCode::Char('k') => p.move_up(),
             KeyCode::Char(' ') => p.toggle_compare(),
@@ -941,7 +919,7 @@ impl App {
         let Screen::Workspace(ws) = &self.screen else {
             return Ok(());
         };
-        let (Some(p), Some(open), book) = (&ws.history, &ws.editor, ws.book.id) else {
+        let (Some(p), Some(open), book) = (ws.modals.history(), &ws.editor, ws.book.id) else {
             return Ok(());
         };
         let Some(s) = p.selected() else { return Ok(()) };
@@ -955,7 +933,8 @@ impl App {
         // 重载面板，让标记跟上。
         let snaps = h.list(ch);
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.history = Some(HistoryPanel::new(snaps));
+            ws.modals
+                .push(Modal::History(Box::new(HistoryPanel::new(snaps))));
         }
         self.toast = Some(if now_pinned {
             "已取消钉住".into()
@@ -973,7 +952,7 @@ impl App {
         let Screen::Workspace(ws) = &self.screen else {
             return Ok(());
         };
-        let (Some(p), Some(open), book) = (&ws.history, &ws.editor, ws.book.id) else {
+        let (Some(p), Some(open), book) = (ws.modals.history(), &ws.editor, ws.book.id) else {
             return Ok(());
         };
         let Some(sel) = p.selected() else {
@@ -1004,8 +983,8 @@ impl App {
 
         let view = DiffView::new(old_title, old_text, new_title, new_text);
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.history = None;
-            ws.diff = Some(view);
+            // 压在历史面板**之上**，不关它：Esc 弹掉 diff 就回到历史（§7.1）。
+            ws.modals.push(Modal::Diff(Box::new(view)));
         }
         Ok(())
     }
@@ -1023,9 +1002,13 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(v) = &mut ws.diff else { return Ok(()) };
+        let Some(v) = ws.modals.diff_mut() else {
+            return Ok(());
+        };
         match code {
-            KeyCode::Esc | KeyCode::Char('q') => ws.diff = None,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::Diff);
+            }
             KeyCode::Char('n') => v.next_hunk(),
             KeyCode::Char('p') => v.prev_hunk(),
             KeyCode::Down | KeyCode::Char('j') => v.scroll_down(),
@@ -1040,7 +1023,9 @@ impl App {
         let Screen::Workspace(ws) = &self.screen else {
             return Ok(());
         };
-        let Some(v) = &ws.diff else { return Ok(()) };
+        let Some(v) = ws.modals.diff() else {
+            return Ok(());
+        };
         let Some(edit) = v.restore_hunk_edit() else {
             self.toast = Some("没有可恢复的改动块".into());
             return Ok(());
@@ -1059,7 +1044,9 @@ impl App {
         let text = open.buffer.contents();
         open.word_count = mj_text::count::count(&text);
         open.autosave.on_edit(std::time::Instant::now());
-        ws.diff = None;
+        // 恢复是终结动作：diff 与它底下的历史面板一起收掉，让用户看见正文。
+        // （历史列表此刻也已过期——刚才恢复前又打了一条快照。）
+        ws.modals.clear();
 
         self.toast = Some("已恢复此块，Ctrl+Z 可撤销".into());
         Ok(())
@@ -1068,7 +1055,7 @@ impl App {
     /// `U`：整章恢复（§6.9 恢复粒度 1）。
     fn restore_whole_chapter(&mut self) -> anyhow::Result<()> {
         let old = match &self.screen {
-            Screen::Workspace(ws) => ws.diff.as_ref().map(|v| v.old_text().to_string()),
+            Screen::Workspace(ws) => ws.modals.diff().map(|v| v.old_text().to_string()),
             _ => None,
         };
         let Some(old) = old else { return Ok(()) };
@@ -1089,7 +1076,8 @@ impl App {
         let text = open.buffer.contents();
         open.word_count = mj_text::count::count(&text);
         open.autosave.on_edit(std::time::Instant::now());
-        ws.diff = None;
+        // 同上：恢复完把浮层全收掉，回到正文。
+        ws.modals.clear();
 
         self.toast = Some("已恢复整章。恢复前的版本已存为快照，可再退回去".into());
         Ok(())
@@ -1098,7 +1086,7 @@ impl App {
     /// `y`：复制旧内容到剪贴板，不改当前版本（§6.9 恢复粒度 3）。
     fn copy_old_content(&mut self) -> anyhow::Result<()> {
         let text = match &self.screen {
-            Screen::Workspace(ws) => ws.diff.as_ref().map(|v| v.copy_text()),
+            Screen::Workspace(ws) => ws.modals.diff().map(|v| v.copy_text()),
             _ => None,
         };
         let Some(text) = text else { return Ok(()) };
@@ -1120,7 +1108,8 @@ impl App {
             self.toast = Some("没有打开的章节".into());
             return Ok(());
         }
-        ws.search = Some(SearchPanel::new(replace_mode));
+        ws.modals
+            .push(Modal::Search(Box::new(SearchPanel::new(replace_mode))));
         Ok(())
     }
 
@@ -1138,7 +1127,7 @@ impl App {
         // F4 切范围（§6.6）。
         if code == KeyCode::F(4) {
             if let Screen::Workspace(ws) = &mut self.screen
-                && let Some(p) = &mut ws.search
+                && let Some(p) = ws.modals.search_mut()
             {
                 p.scope = p.scope.next();
             }
@@ -1148,7 +1137,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.search else {
+        let Some(p) = ws.modals.search_mut() else {
             return Ok(());
         };
         let text = ws.editor.as_ref().map(|o| o.buffer.contents());
@@ -1156,7 +1145,7 @@ impl App {
         let mut need_refresh = false;
         match code {
             KeyCode::Esc => {
-                ws.search = None;
+                ws.modals.close_kind(ModalKind::Search);
                 return Ok(());
             }
             KeyCode::Tab => p.next_field(),
@@ -1164,7 +1153,7 @@ impl App {
             KeyCode::Enter => {
                 let target = p.current_hit().map(|h| h.range.start);
                 if let Some(pos) = target {
-                    ws.search = None;
+                    ws.modals.close_kind(ModalKind::Search);
                     if let Some(open) = &mut ws.editor {
                         open.buffer.move_to(pos);
                         open.viewport.scroll_to_cursor(&open.buffer);
@@ -1209,7 +1198,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.search else {
+        let Some(p) = ws.modals.search_mut() else {
             return Ok(());
         };
         let Some(edit) = p.current_edit() else {
@@ -1237,7 +1226,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.search else {
+        let Some(p) = ws.modals.search_mut() else {
             return Ok(());
         };
 
@@ -1278,7 +1267,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.search else {
+        let Some(p) = ws.modals.search_mut() else {
             return Ok(());
         };
         let Some(open) = &mut ws.editor else {
@@ -1308,7 +1297,8 @@ impl App {
         let chars = self.store.list_characters(book).unwrap_or_default();
         let n = chars.len();
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.character = Some(CharacterPanel::new(chars));
+            ws.modals
+                .push(Modal::Characters(Box::new(CharacterPanel::new(chars))));
         }
         if n == 0 {
             self.toast = Some("还没有角色，按 n 新建".into());
@@ -1338,7 +1328,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.character else {
+        let Some(p) = ws.modals.characters_mut() else {
             return Ok(());
         };
 
@@ -1358,7 +1348,9 @@ impl App {
         match code {
             // 统计视图里 Esc/q 先回到卡片列表，再按才关面板。
             KeyCode::Esc | KeyCode::Char('q') if p.show_stats() => p.clear_stats(),
-            KeyCode::Esc | KeyCode::Char('q') => ws.character = None,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::Characters);
+            }
             KeyCode::Char('/') if !p.show_stats() => p.start_search(),
             KeyCode::Down | KeyCode::Char('j') => p.move_down(),
             KeyCode::Up | KeyCode::Char('k') => p.move_up(),
@@ -1369,10 +1361,10 @@ impl App {
 
     /// `t`：出场统计视图开关。开时扫全书数每个角色的提及次数。
     fn toggle_appearance_stats(&mut self) -> anyhow::Result<()> {
-        let showing = matches!(&self.screen, Screen::Workspace(ws) if ws.character.as_ref().is_some_and(|p| p.show_stats()));
+        let showing = matches!(&self.screen, Screen::Workspace(ws) if ws.modals.characters().is_some_and(|p| p.show_stats()));
         if showing {
             if let Screen::Workspace(ws) = &mut self.screen
-                && let Some(p) = &mut ws.character
+                && let Some(p) = ws.modals.characters_mut()
             {
                 p.clear_stats();
             }
@@ -1384,7 +1376,7 @@ impl App {
         let book = ws.book.id;
         let stats = mj_core::appearance::count_appearances(&self.store, book).unwrap_or_default();
         if let Screen::Workspace(ws) = &mut self.screen
-            && let Some(p) = &mut ws.character
+            && let Some(p) = ws.modals.characters_mut()
         {
             p.set_stats(stats);
         }
@@ -1392,7 +1384,7 @@ impl App {
     }
 
     fn character_searching(&self) -> bool {
-        matches!(&self.screen, Screen::Workspace(ws) if ws.character.as_ref().is_some_and(|p| p.is_searching()))
+        matches!(&self.screen, Screen::Workspace(ws) if ws.modals.characters().is_some_and(|p| p.is_searching()))
     }
 
     /// `n`：新建角色。沿用新建书的做法——先给占位名，之后再改（输入浮层属 M6）。
@@ -1405,7 +1397,8 @@ impl App {
         // 重新载入面板。
         let chars = self.store.list_characters(book).unwrap_or_default();
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.character = Some(CharacterPanel::new(chars));
+            ws.modals
+                .push(Modal::Characters(Box::new(CharacterPanel::new(chars))));
         }
         self.toast = Some("已新建「新角色」".into());
         Ok(())
@@ -1417,7 +1410,7 @@ impl App {
             let Screen::Workspace(ws) = &self.screen else {
                 return Ok(());
             };
-            let Some(p) = &ws.character else {
+            let Some(p) = ws.modals.characters() else {
                 return Ok(());
             };
             match p.current() {
@@ -1428,7 +1421,8 @@ impl App {
         self.store.delete_character(book, id)?;
         let chars = self.store.list_characters(book).unwrap_or_default();
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.character = Some(CharacterPanel::new(chars));
+            ws.modals
+                .push(Modal::Characters(Box::new(CharacterPanel::new(chars))));
         }
         self.toast = Some(format!("已删除「{name}」（在 trash 内，可找回）"));
         Ok(())
@@ -1437,10 +1431,11 @@ impl App {
     /// `e`：编辑当前角色，打开表单（§6.7 [MUST] 表单式编辑）。
     fn edit_character(&mut self) -> anyhow::Result<()> {
         if let Screen::Workspace(ws) = &mut self.screen
-            && let Some(c) = ws.character.as_ref().and_then(|p| p.current()).cloned()
+            && let Some(c) = ws.modals.characters().and_then(|p| p.current()).cloned()
         {
-            ws.character_form = Some(CharacterForm::new(c));
-            ws.character = None; // 表单盖住列表；存/退时再回列表
+            // 压在列表**之上**，不关列表：Esc 弹掉表单就回到列表（§7.1）。
+            ws.modals
+                .push(Modal::CharacterForm(Box::new(CharacterForm::new(c))));
         }
         Ok(())
     }
@@ -1454,7 +1449,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(form) = &mut ws.character_form else {
+        let Some(form) = ws.modals.character_form_mut() else {
             return Ok(());
         };
 
@@ -1499,14 +1494,14 @@ impl App {
             let Screen::Workspace(ws) = &self.screen else {
                 return Ok(());
             };
-            let Some(form) = &ws.character_form else {
+            let Some(form) = ws.modals.character_form() else {
                 return Ok(());
             };
             (ws.book.id, form.to_character())
         };
         self.store.save_character(book, &character)?;
         if let Screen::Workspace(ws) = &mut self.screen
-            && let Some(form) = &mut ws.character_form
+            && let Some(form) = ws.modals.character_form_mut()
         {
             form.mark_saved();
         }
@@ -1522,8 +1517,14 @@ impl App {
         let book = ws.book.id;
         let chars = self.store.list_characters(book).unwrap_or_default();
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.character_form = None;
-            ws.character = Some(CharacterPanel::new(chars));
+            ws.modals.close_kind(ModalKind::CharacterForm);
+            // 底下那层列表要用刚存的数据刷新——名字/身份可能just改过。
+            match ws.modals.characters_mut() {
+                Some(p) => *p = CharacterPanel::new(chars),
+                None => ws
+                    .modals
+                    .push(Modal::Characters(Box::new(CharacterPanel::new(chars)))),
+            }
         }
         Ok(())
     }
@@ -1570,7 +1571,8 @@ impl App {
         let n = issues.len();
         if let Screen::Workspace(ws) = &mut self.screen {
             ws.proof_issues = issues.clone();
-            ws.proof = Some(ProofPanel::new(issues, fold));
+            ws.modals
+                .push(Modal::Proof(Box::new(ProofPanel::new(issues, fold))));
         }
         self.toast = Some(if n == 0 {
             "校对完成：未发现问题".into()
@@ -1591,11 +1593,13 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.proof else {
+        let Some(p) = ws.modals.proof_mut() else {
             return Ok(());
         };
         match code {
-            KeyCode::Esc | KeyCode::F(7) | KeyCode::Char('q') => ws.proof = None,
+            KeyCode::Esc | KeyCode::F(7) | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::Proof);
+            }
             KeyCode::Down | KeyCode::Char('j') => p.move_down(),
             KeyCode::Up | KeyCode::Char('k') => p.move_up(),
             KeyCode::Char('f') => p.toggle_folded(),
@@ -1611,7 +1615,7 @@ impl App {
             KeyCode::Enter => {
                 let target = p.current().map(|i| i.range.start);
                 if let Some(pos) = target {
-                    ws.proof = None;
+                    ws.modals.close_kind(ModalKind::Proof);
                     if let Some(open) = &mut ws.editor {
                         open.buffer.move_to(pos);
                         open.viewport.scroll_to_cursor(&open.buffer);
@@ -1629,7 +1633,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &ws.proof else {
+        let Some(p) = ws.modals.proof() else {
             return Ok(());
         };
         let Some(issue) = p.current() else {
@@ -1662,7 +1666,7 @@ impl App {
             let Screen::Workspace(ws) = &self.screen else {
                 return Ok(());
             };
-            let (Some(p), Some(open)) = (&ws.proof, &ws.editor) else {
+            let (Some(p), Some(open)) = (ws.modals.proof(), &ws.editor) else {
                 return Ok(());
             };
             match p.current() {
@@ -1683,7 +1687,7 @@ impl App {
 
         // 从当前列表与下划线集里摘掉。
         if let Screen::Workspace(ws) = &mut self.screen
-            && let Some(p) = &mut ws.proof
+            && let Some(p) = ws.modals.proof_mut()
             && let Some(removed) = p.remove_current()
         {
             ws.proof_issues
@@ -1715,7 +1719,8 @@ impl App {
         let fold = self.config.proof.fold_below;
         if let Screen::Workspace(ws) = &mut self.screen {
             ws.proof_issues = issues.clone();
-            ws.proof = Some(ProofPanel::new(issues, fold));
+            ws.modals
+                .push(Modal::Proof(Box::new(ProofPanel::new(issues, fold))));
         }
     }
 
@@ -1740,7 +1745,10 @@ impl App {
             self.toast = Some("本章已符合排版规则，无需改动".into());
             return Ok(());
         }
-        ws.format_preview = Some(FormatPreview::new(&text, edits));
+        ws.modals
+            .push(Modal::FormatPreview(Box::new(FormatPreview::new(
+                &text, edits,
+            ))));
         Ok(())
     }
 
@@ -1769,12 +1777,14 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = &mut ws.format_preview else {
+        let Some(p) = ws.modals.format_preview_mut() else {
             return Ok(());
         };
 
         match code {
-            KeyCode::Esc | KeyCode::F(5) | KeyCode::Char('q') => ws.format_preview = None,
+            KeyCode::Esc | KeyCode::F(5) | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::FormatPreview);
+            }
             KeyCode::Down | KeyCode::Char('j') => p.move_down(),
             KeyCode::Up | KeyCode::Char('k') => p.move_up(),
             KeyCode::Char(' ') => p.toggle(),
@@ -1790,7 +1800,7 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(p) = ws.format_preview.take() else {
+        let Some(p) = ws.modals.take_format_preview() else {
             return Ok(());
         };
 
@@ -1835,12 +1845,14 @@ impl App {
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
-        let Some(stats) = &mut ws.stats else {
+        let Some(stats) = ws.modals.stats_mut() else {
             return Ok(());
         };
 
         match code {
-            KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('q') => ws.stats = None,
+            KeyCode::Esc | KeyCode::F(3) | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::Stats);
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 let rows = Stats::rows(&ws.book, |_| 0).len();
                 stats.scroll_down(rows, 20);
@@ -2360,14 +2372,14 @@ impl App {
 
     #[doc(hidden)]
     pub fn confirm_open_for_test(&self) -> bool {
-        matches!(&self.screen, Screen::Workspace(ws) if ws.confirm.is_some())
+        matches!(&self.screen, Screen::Workspace(ws) if ws.modals.contains(ModalKind::Confirm))
     }
 
     /// 供测试：校对面板可见问题数（None = 面板没开）。
     #[doc(hidden)]
     pub fn proof_visible_for_test(&self) -> Option<usize> {
         match &self.screen {
-            Screen::Workspace(ws) => ws.proof.as_ref().map(|p| p.visible_count()),
+            Screen::Workspace(ws) => ws.modals.proof().map(|p| p.visible_count()),
             _ => None,
         }
     }
@@ -2381,6 +2393,20 @@ impl App {
         }
     }
 
+    /// 供测试：浮层栈自底向上的种类名（§7.1）。
+    #[doc(hidden)]
+    pub fn modal_stack_for_test(&self) -> Vec<String> {
+        match &self.screen {
+            Screen::Workspace(ws) => ws
+                .modals
+                .kinds()
+                .into_iter()
+                .map(|k| format!("{k:?}"))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// 供测试：@ 补全是否激活。
     #[doc(hidden)]
     pub fn completion_active_for_test(&self) -> bool {
@@ -2391,7 +2417,7 @@ impl App {
     #[doc(hidden)]
     pub fn character_filtered_for_test(&self) -> Option<usize> {
         match &self.screen {
-            Screen::Workspace(ws) => ws.character.as_ref().map(|p| p.filtered_count()),
+            Screen::Workspace(ws) => ws.modals.characters().map(|p| p.filtered_count()),
             _ => None,
         }
     }
@@ -2400,7 +2426,7 @@ impl App {
     #[doc(hidden)]
     pub fn character_stats_open_for_test(&self) -> Option<bool> {
         match &self.screen {
-            Screen::Workspace(ws) => ws.character.as_ref().map(|p| p.show_stats()),
+            Screen::Workspace(ws) => ws.modals.characters().map(|p| p.show_stats()),
             _ => None,
         }
     }
@@ -2410,8 +2436,8 @@ impl App {
     pub fn character_current_name_for_test(&self) -> Option<String> {
         match &self.screen {
             Screen::Workspace(ws) => ws
-                .character
-                .as_ref()
+                .modals
+                .characters()
                 .and_then(|p| p.current())
                 .map(|c| c.name.clone()),
             _ => None,
@@ -2437,7 +2463,7 @@ impl App {
     #[doc(hidden)]
     pub fn search_scope_for_test(&self) -> Option<Scope> {
         match &self.screen {
-            Screen::Workspace(ws) => ws.search.as_ref().map(|p| p.scope),
+            Screen::Workspace(ws) => ws.modals.search().map(|p| p.scope),
             _ => None,
         }
     }
@@ -2446,7 +2472,7 @@ impl App {
     #[doc(hidden)]
     pub fn set_replace_text_for_test(&mut self, to: &str) {
         if let Screen::Workspace(ws) = &mut self.screen
-            && let Some(p) = &mut ws.search
+            && let Some(p) = ws.modals.search_mut()
         {
             p.replace_with = to.to_string();
         }
@@ -2476,7 +2502,7 @@ impl App {
                 .as_ref()
                 .map(|o| o.buffer.contents())
                 .unwrap_or_default();
-            if let Some(p) = &mut ws.search {
+            if let Some(p) = ws.modals.search_mut() {
                 p.query = query.to_string();
                 p.replace_with = "霜".to_string();
                 p.refresh(&text);
@@ -2512,7 +2538,7 @@ impl App {
     #[doc(hidden)]
     pub fn open_stats_for_demo(&mut self) {
         if let Screen::Workspace(ws) = &mut self.screen {
-            ws.stats = Some(Stats::new());
+            ws.modals.push(Modal::Stats(Box::new(Stats::new())));
         }
     }
 
@@ -2534,7 +2560,7 @@ impl App {
 
         // 统计面板打开时占满正文区（浮层语义）。
         let stats_rows = match &self.screen {
-            Screen::Workspace(ws) if ws.stats.is_some() => {
+            Screen::Workspace(ws) if ws.modals.contains(ModalKind::Stats) => {
                 Some(Stats::rows(&ws.book, self.no_punct_lookup()))
             }
             _ => None,
@@ -2553,35 +2579,40 @@ impl App {
         match &mut self.screen {
             Screen::Shelf(shelf) => render_shelf(frame, body, shelf, theme),
             Screen::Workspace(ws) => {
+                // 基底：目录树 + 正文。终端光标只在没有浮层/作业时显示——
+                // 否则光标会落在被盖住的正文里，看着像跑到浮层外面去了。
+                let show_cursor = ws.modals.is_empty() && ws.batch.is_none();
+                render_workspace(frame, body, ws, theme, show_cursor);
+
                 if let Some(job) = &ws.batch {
+                    frame.render_widget(ratatui::widgets::Clear, body);
                     render_batch(frame, body, job, theme);
-                } else if let Some(v) = &mut ws.diff {
-                    render_diff(frame, body, v, theme);
-                } else if let Some(p) = &mut ws.history {
-                    render_history(frame, body, p, theme);
-                } else if let Some(p) = &mut ws.search {
-                    render_search(frame, body, p, theme);
-                } else if let Some(p) = &mut ws.format_preview {
-                    render_format_preview(frame, body, p, theme);
-                } else if let Some(p) = &mut ws.proof {
-                    render_proof(frame, body, p, theme);
-                } else if let Some(fm) = &mut ws.character_form {
-                    render_character_form(frame, body, fm, theme);
-                } else if let Some(p) = &mut ws.character {
-                    render_characters(frame, body, p, theme);
-                } else if let (Some(st), Some(rows)) = (&ws.stats, stats_rows) {
-                    render_stats(frame, body, st, &rows, &ws.book.title, theme);
-                } else {
-                    render_workspace(frame, body, ws, theme);
+                }
+
+                // 浮层自底向上叠画：后压进来的画在上面（§7.1）。
+                let book_title = ws.book.title.clone();
+                for m in ws.modals.iter_mut() {
+                    // 铺满型浮层先清底，免得正文从空白处透上来。
+                    if m.is_fullscreen() {
+                        frame.render_widget(ratatui::widgets::Clear, body);
+                    }
+                    match m {
+                        Modal::Diff(v) => render_diff(frame, body, v, theme),
+                        Modal::History(p) => render_history(frame, body, p, theme),
+                        Modal::Search(p) => render_search(frame, body, p, theme),
+                        Modal::FormatPreview(p) => render_format_preview(frame, body, p, theme),
+                        Modal::Proof(p) => render_proof(frame, body, p, theme),
+                        Modal::CharacterForm(fm) => render_character_form(frame, body, fm, theme),
+                        Modal::Characters(p) => render_characters(frame, body, p, theme),
+                        Modal::Confirm(c) => render_confirm(frame, body, c, theme),
+                        Modal::Stats(st) => {
+                            if let Some(rows) = &stats_rows {
+                                render_stats(frame, body, st, rows, &book_title, theme);
+                            }
+                        }
+                    }
                 }
             }
-        }
-
-        // 确认框叠在上面那层之上——它是从查找面板/排版预览上弹出来的。
-        if let Screen::Workspace(ws) = &self.screen
-            && let Some(c) = &ws.confirm
-        {
-            render_confirm(frame, body, c, theme);
         }
 
         self.render_status(frame, status);
@@ -2599,8 +2630,8 @@ impl App {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
                 }
-                Screen::Workspace(ws) if ws.character_form.is_some() => {
-                    let editing = ws.character_form.as_ref().is_some_and(|f| f.is_editing());
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::CharacterForm) => {
+                    let editing = ws.modals.character_form().is_some_and(|f| f.is_editing());
                     if editing {
                         spans.push(Span::raw(
                             " 编辑字段 │ 输入内容 │ Enter 换行/完成 │ Esc 结束本字段 ",
@@ -2611,8 +2642,8 @@ impl App {
                         ));
                     }
                 }
-                Screen::Workspace(ws) if ws.character.is_some() => {
-                    let panel = ws.character.as_ref();
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Characters) => {
+                    let panel = ws.modals.characters();
                     if panel.is_some_and(|p| p.is_searching()) {
                         spans.push(Span::raw(" 搜索角色 │ 输入筛选 │ Enter/Esc 结束搜索 "));
                     } else if panel.is_some_and(|p| p.show_stats()) {
@@ -2623,11 +2654,11 @@ impl App {
                         ));
                     }
                 }
-                Screen::Workspace(ws) if ws.proof.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Proof) => {
                     spans.push(Span::raw(
                         " 校对 │ j/k 移动 │ Enter 跳转 │ a 应用建议 │ i 忽略 │ I 永久忽略 ",
                     ));
-                    if let Some((n, shown)) = ws.proof.as_ref().and_then(|p| p.fold_hint()) {
+                    if let Some((n, shown)) = ws.modals.proof().and_then(|p| p.fold_hint()) {
                         let label = if shown {
                             format!("│ f 收起 {n} 条低置信 ")
                         } else {
@@ -2637,26 +2668,26 @@ impl App {
                     }
                     spans.push(Span::raw("│ Esc 关闭 "));
                 }
-                Screen::Workspace(ws) if ws.confirm.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Confirm) => {
                     spans.push(Span::raw(" ←/→ 选择 │ Enter 确定 │ y 执行 │ Esc 取消 "));
                 }
                 Screen::Workspace(ws) if ws.batch.is_some() => {
                     spans.push(Span::raw(" 批量作业进行中 │ Esc 中断 "));
                 }
-                Screen::Workspace(ws) if ws.diff.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Diff) => {
                     // §12.4 的底栏。
                     spans.push(Span::raw(
                         " n/p 跳转改动 │ u 恢复此块 │ U 恢复整章 │ y 复制旧内容 │ Esc 关闭 ",
                     ));
                 }
-                Screen::Workspace(ws) if ws.history.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::History) => {
                     spans.push(Span::raw(
                         " 历史 │ Enter 看 diff │ Space 选对照条 │ P 钉住 │ Esc 关闭 ",
                     ));
                 }
-                Screen::Workspace(ws) if ws.search.is_some() => {
-                    let wide = ws.search.as_ref().is_some_and(|s| s.scope.is_wide());
-                    let hint = if !ws.search.as_ref().is_some_and(|s| s.replace_mode) {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Search) => {
+                    let wide = ws.modals.search().is_some_and(|s| s.scope.is_wide());
+                    let hint = if !ws.modals.search().is_some_and(|s| s.replace_mode) {
                         " 查找 │ Tab 切到结果 │ Enter 跳转 │ Esc 关闭 "
                     } else if wide {
                         // 宽范围下勾选管不到别的章，Alt+R 也只作用于当前章——
@@ -2667,12 +2698,12 @@ impl App {
                     };
                     spans.push(Span::raw(hint));
                 }
-                Screen::Workspace(ws) if ws.format_preview.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::FormatPreview) => {
                     spans.push(Span::raw(
                         " 排版预览 │ Space 逐条取消 │ a 全选 │ n 全不选 │ Enter 应用 │ Esc 放弃 ",
                     ));
                 }
-                Screen::Workspace(ws) if ws.stats.is_some() => {
+                Screen::Workspace(ws) if ws.modals.contains(ModalKind::Stats) => {
                     spans.push(Span::raw(" 统计面板 │ e 导出 CSV │ ↑↓ 滚动 │ Esc 关闭 "));
                 }
                 Screen::Workspace(ws) => {
@@ -2818,7 +2849,13 @@ fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf, theme: &T
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, theme: &Theme) {
+fn render_workspace(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    ws: &mut Workspace,
+    theme: &Theme,
+    show_cursor: bool,
+) {
     // §7.2：窄屏（< 80 列）自动隐藏侧栏，只留正文。
     let narrow = area.width < NARROW_THRESHOLD;
     let show_tree = ws.show_tree && !narrow;
@@ -2834,7 +2871,7 @@ fn render_workspace(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, 
     if let Some(ta) = tree_area {
         render_tree(frame, ta, ws, theme);
     }
-    render_editor(frame, editor_area, ws, theme);
+    render_editor(frame, editor_area, ws, theme, show_cursor);
 }
 
 /// 历史面板（§6.9）。
@@ -3342,7 +3379,13 @@ fn render_tree(frame: &mut ratatui::Frame, area: Rect, ws: &Workspace, theme: &T
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, theme: &Theme) {
+fn render_editor(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    ws: &mut Workspace,
+    theme: &Theme,
+    show_cursor: bool,
+) {
     let focused = ws.focus == Focus::Editor;
     let title = match &ws.editor {
         Some(_) => format!(" 正文 · 《{}》 ", ws.book.title),
@@ -3408,7 +3451,10 @@ fn render_editor(frame: &mut ratatui::Frame, area: Rect, ws: &mut Workspace, the
     let cursor_pos = open.viewport.cursor_screen_pos(&open.buffer);
 
     // 光标只在编辑器有焦点时显示。
-    if focused && let Some((col, row)) = cursor_pos {
+    if focused
+        && show_cursor
+        && let Some((col, row)) = cursor_pos
+    {
         frame.set_cursor_position((inner.x + col, inner.y + row));
     }
 

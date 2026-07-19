@@ -180,16 +180,28 @@ fn edit_form_splits_aliases_on_save() {
     assert_eq!(c.aliases, vec!["沈公子", "小砚"]);
 }
 
-/// 存盘后编辑的名字驱动校对：改名后一致性检查用的是新名。
+/// e 进表单、Esc 回列表。
+///
+/// 表单是**叠在**列表之上的（§7.1 浮层栈），故开表单时列表仍在栈里、
+/// 只是被盖住；Esc 弹掉表单即回到它。层次本身由 modal_stack_flow.rs 断言。
 #[test]
 fn esc_from_form_returns_to_list() {
     let f = setup(&["沈砚"]);
     let mut app = f.app();
     open_panel(&mut app);
     app.press_for_test(KeyCode::Char('e'), NONE).unwrap();
-    assert_eq!(app.character_filtered_for_test(), None, "表单里列表不可见");
+    assert_eq!(
+        app.modal_stack_for_test(),
+        vec!["Characters", "CharacterForm"],
+        "表单应叠在列表上"
+    );
     app.press_for_test(KeyCode::Esc, NONE).unwrap();
-    assert_eq!(app.character_filtered_for_test(), Some(1), "Esc 回到列表");
+    assert_eq!(
+        app.modal_stack_for_test(),
+        vec!["Characters"],
+        "Esc 回到列表"
+    );
+    assert_eq!(app.character_filtered_for_test(), Some(1));
 }
 
 fn draw_ok(app: &mut App, w: u16, h: u16) -> bool {
