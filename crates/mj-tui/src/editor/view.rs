@@ -24,6 +24,12 @@ pub struct DisplayLine {
     /// 渲染时该行左侧应补的空格列数。续行为 `WRAP_INDENT`，段首为 0
     /// （段首的缩进来自正文里真实存在的全角空格，不是渲染加的）。
     pub indent: usize,
+    /// 段间距撑出来的空行（`[appearance] paragraph_spacing`）。
+    ///
+    /// 它**不对应正文里的任何字节**，只是排版留白。之所以做成显示行而不是
+    /// 渲染时另加，是因为光标位置与滚动都从 `visible_lines` 的下标算：
+    /// 空行若不在这张表里，画出来的行和算出来的行就会错位，光标飘到别处。
+    pub is_spacer: bool,
 }
 
 /// 视口状态。
@@ -33,6 +39,8 @@ pub struct Viewport {
     top_logical: usize,
     height: usize,
     width: usize,
+    /// 段与段之间额外空出的行数（`[appearance] paragraph_spacing`）。
+    paragraph_spacing: usize,
 }
 
 impl Viewport {
@@ -41,7 +49,12 @@ impl Viewport {
             top_logical: 0,
             height,
             width,
+            paragraph_spacing: 0,
         }
+    }
+
+    pub fn set_paragraph_spacing(&mut self, n: usize) {
+        self.paragraph_spacing = n;
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -81,6 +94,23 @@ impl Viewport {
 
             let para = line_text(buf, start..end);
 
+            // 段间距：段与段之间垫空行。视口顶上那段不垫——那会让正文
+            // 一上来就悬空一截，看着像滚错了位置。
+            if !out.is_empty() {
+                for _ in 0..self.paragraph_spacing {
+                    if out.len() >= self.height {
+                        break;
+                    }
+                    out.push(DisplayLine {
+                        range: start..start,
+                        logical_line: logical,
+                        is_paragraph_start: false,
+                        indent: 0,
+                        is_spacer: true,
+                    });
+                }
+            }
+
             if para.is_empty() {
                 // 空段落也占一行——否则空行被吞掉，段间距全乱。
                 out.push(DisplayLine {
@@ -88,6 +118,7 @@ impl Viewport {
                     logical_line: logical,
                     is_paragraph_start: true,
                     indent: 0,
+                    is_spacer: false,
                 });
             } else {
                 for (i, r) in self.wrap_paragraph(&para).into_iter().enumerate() {
@@ -99,6 +130,7 @@ impl Viewport {
                         logical_line: logical,
                         is_paragraph_start: i == 0,
                         indent: if i == 0 { 0 } else { WRAP_INDENT },
+                        is_spacer: false,
                     });
                 }
             }
@@ -181,15 +213,17 @@ impl Viewport {
         let cursor = buf.cursor();
         let lines = self.visible_lines(buf);
 
+        // 段间距撑出来的空行不对应任何字节，跳过——否则光标会落到一条
+        // 纯留白的行上（它的 range 恰好等于下一段段首，末尾匹配会命中它）。
         // 先找严格包含光标的行（start <= cursor < end）。
         for (row, line) in lines.iter().enumerate() {
-            if cursor >= line.range.start && cursor < line.range.end {
+            if !line.is_spacer && cursor >= line.range.start && cursor < line.range.end {
                 return Some((self.col_of(buf, line, cursor), row as u16));
             }
         }
         // 再退而求其次：落在某行末尾（段落末尾的正常位置）。
         for (row, line) in lines.iter().enumerate() {
-            if cursor == line.range.end {
+            if !line.is_spacer && cursor == line.range.end {
                 return Some((self.col_of(buf, line, cursor), row as u16));
             }
         }

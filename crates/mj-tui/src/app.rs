@@ -134,6 +134,8 @@ pub struct App {
     ignore: Option<mj_core::proofing::IgnoreSet>,
     /// 当前配色（§6.10）。启动时按 config.appearance.theme + 终端色深解析。
     theme: Theme,
+    /// 专注模式（F11，§7.3）：收起目录树、按 focus_column_width 收窄正文。
+    focus_mode: bool,
 }
 
 impl App {
@@ -155,6 +157,7 @@ impl App {
             batch_undo: None,
             ignore: None,
             theme,
+            focus_mode: false,
         })
     }
 
@@ -418,6 +421,8 @@ impl App {
             }
             // F2 外观设置（§6.10）。
             KeyCode::F(2) => return self.run_command(Command::Appearance),
+            // F11 专注模式（§7.3）。
+            KeyCode::F(11) => return self.run_command(Command::FocusMode),
             // F1 帮助（键位总表，§7.3）。
             KeyCode::F(1) => {
                 if let Screen::Workspace(ws) = &mut self.screen {
@@ -1419,6 +1424,26 @@ impl App {
                 Ok(())
             }
             Command::Appearance => self.open_settings(),
+            Command::FocusMode => {
+                self.focus_mode = !self.focus_mode;
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    // 专注模式收起目录树并把焦点交给正文——留着树却不显示，
+                    // 会出现「按键打不进正文」的怪状态。
+                    ws.show_tree = !self.focus_mode;
+                    if self.focus_mode {
+                        ws.focus = Focus::Editor;
+                    }
+                }
+                self.toast = Some(
+                    if self.focus_mode {
+                        "专注模式：开（F11 退出）"
+                    } else {
+                        "专注模式：关"
+                    }
+                    .into(),
+                );
+                Ok(())
+            }
         }
     }
 
@@ -2896,8 +2921,9 @@ impl App {
             _ => None,
         };
 
-        // 配色与 screen 是不同字段，可与下面的可变借用并存。
+        // 配色与版面参数：与 screen 是不同字段，可与下面的可变借用并存。
         let theme = &self.theme;
+        let layout = EditorLayout::from_config(&self.config, self.focus_mode);
 
         // 先铺一层主题底色——sepia 这类预设的观感八成来自它（§2.1「二级降级」）。
         // 兜底主题的 bg 是 Reset，铺上去等同不铺，对 8 色终端无害。
@@ -2912,7 +2938,7 @@ impl App {
                 // 基底：目录树 + 正文。终端光标只在没有浮层/作业时显示——
                 // 否则光标会落在被盖住的正文里，看着像跑到浮层外面去了。
                 let show_cursor = ws.modals.is_empty() && ws.batch.is_none();
-                render_workspace(frame, body, ws, theme, show_cursor);
+                render_workspace(frame, body, ws, theme, show_cursor, &layout);
 
                 if let Some(job) = &ws.batch {
                     frame.render_widget(ratatui::widgets::Clear, body);
@@ -3201,6 +3227,7 @@ fn render_workspace(
     ws: &mut Workspace,
     theme: &Theme,
     show_cursor: bool,
+    layout: &EditorLayout,
 ) {
     // §7.2：窄屏（< 80 列）自动隐藏侧栏，只留正文。
     let narrow = area.width < NARROW_THRESHOLD;
@@ -3217,7 +3244,7 @@ fn render_workspace(
     if let Some(ta) = tree_area {
         render_tree(frame, ta, ws, theme);
     }
-    render_editor(frame, editor_area, ws, theme, show_cursor);
+    render_editor(frame, editor_area, ws, theme, show_cursor, layout);
 }
 
 /// 历史面板（§6.9）。
@@ -3731,6 +3758,7 @@ fn render_editor(
     ws: &mut Workspace,
     theme: &Theme,
     show_cursor: bool,
+    layout: &EditorLayout,
 ) {
     let focused = ws.focus == Focus::Editor;
     let title = match &ws.editor {
@@ -3757,51 +3785,102 @@ fn render_editor(
         return;
     };
 
-    // 用真实尺寸校正视口——渲染前不知道终端多大。
+    // 版面：先按留白与栏宽算出正文该占的横向范围（§6.10）。
+    let (text_x, text_w) = layout.text_span(inner);
+    // 行号槽：宽度按最大行号定，够 4 位就留 5 列。
+    let gutter = if layout.line_number {
+        let digits = open.buffer.text().len_lines().max(1).to_string().len() as u16;
+        digits + 1
+    } else {
+        0
+    };
+    let body_x = text_x + gutter;
+    let body_w = text_w.saturating_sub(gutter).max(1);
+
+    // 视口宽度必须**等于实际绘制宽度**，否则折行的位置和画出来的对不上，
+    // 行尾会溢出到留白里。
+    open.viewport.resize(body_w as usize, inner.height as usize);
     open.viewport
-        .resize(inner.width as usize, inner.height as usize);
+        .set_paragraph_spacing(layout.paragraph_spacing as usize);
     open.viewport.scroll_to_cursor(&open.buffer);
 
-    let lines: Vec<Line> = open
-        .viewport
-        .visible_lines(&open.buffer)
-        .iter()
-        .map(|dl| {
-            let text = crate::editor::view::line_slice(&open.buffer, dl.range.clone());
-            // 续行缩进，与段首正文左边缘对齐——否则折行看起来像新段落。
-            let mut spans: Vec<Span> = Vec::new();
-            if dl.indent > 0 {
-                spans.push(Span::raw(" ".repeat(dl.indent)));
-            }
-            // 按校对命中把本行切段，命中处加下划线着色（§6.8 [MUST]）。
-            for seg in proof_panel::line_segments(&text, dl.range.start, issues) {
-                match seg.hit {
-                    None => spans.push(Span::raw(seg.text)),
-                    Some(sev) => spans.push(Span::styled(
-                        seg.text,
-                        Style::default()
-                            .fg(proof_severity_color(sev, theme))
-                            .add_modifier(Modifier::UNDERLINED),
-                    )),
-                }
-            }
-            Line::from(spans)
-        })
-        .collect();
+    let visible = open.viewport.visible_lines(&open.buffer);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut gutter_lines: Vec<Line> = Vec::new();
+    for dl in &visible {
+        // 段间距撑出来的空行：不画正文，行号槽也留空。
+        if dl.is_spacer {
+            lines.push(Line::raw(""));
+            gutter_lines.push(Line::raw(""));
+            continue;
+        }
+        if gutter > 0 {
+            // 只在段首标行号——续行标号会让人以为那是新的一段。
+            let label = if dl.is_paragraph_start {
+                format!(
+                    "{:>width$} ",
+                    dl.logical_line + 1,
+                    width = (gutter - 1) as usize
+                )
+            } else {
+                " ".repeat(gutter as usize)
+            };
+            gutter_lines.push(Line::from(Span::styled(
+                label,
+                Style::default().fg(theme.dim),
+            )));
+        }
 
+        let text = crate::editor::view::line_slice(&open.buffer, dl.range.clone());
+        // 续行缩进，与段首正文左边缘对齐——否则折行看起来像新段落。
+        let mut spans: Vec<Span> = Vec::new();
+        if dl.indent > 0 {
+            spans.push(Span::raw(" ".repeat(dl.indent)));
+        }
+        // 按校对命中把本行切段，命中处加下划线着色（§6.8 [MUST]）。
+        for seg in proof_panel::line_segments(&text, dl.range.start, issues) {
+            match seg.hit {
+                None => spans.push(Span::raw(seg.text)),
+                Some(sev) => spans.push(Span::styled(
+                    seg.text,
+                    Style::default()
+                        .fg(proof_severity_color(sev, theme))
+                        .add_modifier(Modifier::UNDERLINED),
+                )),
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    if gutter > 0 {
+        frame.render_widget(
+            Paragraph::new(gutter_lines),
+            Rect {
+                x: text_x,
+                y: inner.y,
+                width: gutter,
+                height: inner.height,
+            },
+        );
+    }
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().fg(theme.fg)),
-        inner,
+        Rect {
+            x: body_x,
+            y: inner.y,
+            width: body_w,
+            height: inner.height,
+        },
     );
 
     let cursor_pos = open.viewport.cursor_screen_pos(&open.buffer);
 
-    // 光标只在编辑器有焦点时显示。
+    // 光标只在编辑器有焦点时显示。位置要跟着正文一起右移（留白 + 行号槽）。
     if focused
         && show_cursor
         && let Some((col, row)) = cursor_pos
     {
-        frame.set_cursor_position((inner.x + col, inner.y + row));
+        frame.set_cursor_position((body_x + col, inner.y + row));
     }
 
     // @ 补全弹框（§6.7）：贴着光标下方列候选。
@@ -4223,6 +4302,57 @@ fn render_characters(
                 .collect();
             frame.render_widget(Paragraph::new(lines), dinner);
         }
+    }
+}
+
+/// 正文版面参数（§6.10 `[appearance]` + §7.3 专注模式）。
+///
+/// 把它们从 config 摘出来单独传，是因为专注模式要**临时覆盖**栏宽：
+/// 直接读 config 就得在渲染里到处判断「现在是不是专注模式」。
+#[derive(Debug, Clone, Copy)]
+struct EditorLayout {
+    /// 正文栏宽，单位「全角字」；0 = 撑满。
+    column_width: u16,
+    /// 左右留白列数。
+    margin: u16,
+    /// 段间额外空行。
+    paragraph_spacing: u16,
+    line_number: bool,
+}
+
+impl EditorLayout {
+    fn from_config(config: &Config, focus_mode: bool) -> Self {
+        let a = &config.appearance;
+        Self {
+            // 专注模式用 editor.focus_column_width 覆盖常规栏宽（§8）。
+            column_width: if focus_mode {
+                config.editor.focus_column_width
+            } else {
+                a.column_width
+            },
+            margin: a.margin,
+            paragraph_spacing: a.paragraph_spacing,
+            // 专注模式下不显示行号：那是「专注」的反面。
+            line_number: a.line_number && !focus_mode,
+        }
+    }
+
+    /// 在给定可用区里算出正文该占的横向范围。
+    ///
+    /// 顺序：先扣左右留白，再按栏宽收窄并**居中**——居中是长文本可读性的关键，
+    /// 满屏宽的中文正文一行三四十字，眼睛来回扫得很累。
+    /// 全程 saturating：§7.2 `[MUST]` 窄至 60 列不崩，别让减法翻负。
+    fn text_span(&self, area: Rect) -> (u16, u16) {
+        let margin = self.margin.min(area.width / 4);
+        let avail = area.width.saturating_sub(margin * 2).max(1);
+        // 栏宽单位是全角字，一个全角字占两列。
+        let want = if self.column_width == 0 {
+            avail
+        } else {
+            (self.column_width.saturating_mul(2)).min(avail)
+        };
+        let x = area.x + margin + (avail.saturating_sub(want)) / 2;
+        (x, want.max(1))
     }
 }
 

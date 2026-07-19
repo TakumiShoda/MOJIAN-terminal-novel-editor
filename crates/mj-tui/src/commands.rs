@@ -32,6 +32,7 @@ pub enum Command {
     // 视图
     ToggleTree,
     Appearance,
+    FocusMode,
     // 帮助
     Help,
 }
@@ -220,6 +221,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "外观",
         desc: "换主题、看版面设置；字体不可用时给终端配置片段",
         keys: "F2",
+        category: Category::View,
+    },
+    CommandSpec {
+        cmd: Command::FocusMode,
+        name: "专注模式",
+        desc: "收起目录树，正文收窄居中，只剩字",
+        keys: "F11",
         category: Category::View,
     },
     // ---- 帮助 ----
