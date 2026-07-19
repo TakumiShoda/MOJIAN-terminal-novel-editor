@@ -75,9 +75,10 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn warn(msg: impl Into<String>) -> Self {
+    /// 记一条日志并把话带给 UI。模型后端（`proof_llm`）走同一条路。
+    pub(crate) fn warn(msg: impl Into<String>) -> Self {
         let msg = msg.into();
-        tracing::warn!("外部校对：{msg}");
+        tracing::warn!("校对后端：{msg}");
         Self {
             issues: Vec::new(),
             warning: Some(msg),

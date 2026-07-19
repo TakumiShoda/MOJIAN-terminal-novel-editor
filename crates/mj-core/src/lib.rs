@@ -13,6 +13,7 @@ pub mod index;
 pub mod lock;
 pub mod model;
 pub mod proof_external;
+pub mod proof_llm;
 pub mod proofing;
 pub mod slug;
 pub mod store;

@@ -122,9 +122,14 @@ pub struct ChapterProof {
 }
 
 /// 一章的校对器：跑本地规则（可选再跑外部命令），滤掉已忽略项。
+///
+/// 模型后端**不在** `check_chapter` 里：那个方法在 UI 线程上同步跑，而模型
+/// 一趟要好几秒，混进去就是按下 F7 界面卡死。它单开一个 `check_chapter_llm`，
+/// 由调用方丢进工作线程（§7「长任务一律进工作线程 + CancelToken」）。
 pub struct Proofer {
     reader: RuleProofreader,
     external: crate::proof_external::ExternalProofreader,
+    llm: crate::proof_llm::LlmProofreader,
 }
 
 impl Proofer {
@@ -132,6 +137,7 @@ impl Proofer {
         Self {
             reader: RuleProofreader::new(confusion, opts),
             external: crate::proof_external::ExternalProofreader::new(Default::default()),
+            llm: crate::proof_llm::LlmProofreader::new(Default::default()),
         }
     }
 
@@ -150,7 +156,40 @@ impl Proofer {
         }
         let mut p = Self::new(confusion, config.proof.to_options());
         p.external = crate::proof_external::ExternalProofreader::new(config.proof.external.clone());
+        p.llm = crate::proof_llm::LlmProofreader::new(config.proof.llm.clone())
+            .with_cache(ws.llm_cache_file());
         p
+    }
+
+    /// 模型后端是否可用。
+    pub fn llm_enabled(&self) -> bool {
+        self.llm.is_enabled()
+    }
+
+    /// 模型后端开着但还差点什么时的说明（没开则 None）。
+    pub fn llm_setup_problem(&self) -> Option<String> {
+        self.llm.setup_problem()
+    }
+
+    /// 用模型校对整章（§6.8 第 3 条）。**只出模型的结果**——本地规则那趟
+    /// 已经跑过了，调用方把两边并起来即可。
+    ///
+    /// 会走网络、要好几秒，**必须在工作线程上调**。`cancel` 在批与批之间生效。
+    pub fn check_chapter_llm(
+        &self,
+        text: &str,
+        ctx: &ProofContext,
+        ignore: &IgnoreSet,
+        cancel: &CancelToken,
+    ) -> ChapterProof {
+        let paras = split_paragraphs(text);
+        let out = self.llm.check(&paras, ctx, cancel);
+        let mut issues = out.issues;
+        issues.retain(|i| !ignore.contains(&ignore_key(text, i)));
+        ChapterProof {
+            issues,
+            warning: out.warning,
+        }
     }
 
     /// 校对整章正文。已忽略的问题被滤掉（§6.8）。

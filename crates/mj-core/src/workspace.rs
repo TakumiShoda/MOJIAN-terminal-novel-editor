@@ -64,6 +64,14 @@ impl Workspace {
         self.dict_dir().join("ignore.json")
     }
 
+    /// 大模型校对的段落级结果缓存（§6.8 的 `proof_cache`）。
+    ///
+    /// 放 cache/ 而非 dict/：dict/ 是用户资产（该进 git），这里是纯派生数据，
+    /// 删掉只会让下次多花几次 API 调用，不丢任何东西。
+    pub fn llm_cache_file(&self) -> PathBuf {
+        self.root.join("cache").join("proof_llm.json")
+    }
+
     /// 用户自建主题目录（§6.10：主题定义为 TOML，放 themes/*.toml）。
     pub fn themes_dir(&self) -> PathBuf {
         self.root.join("themes")

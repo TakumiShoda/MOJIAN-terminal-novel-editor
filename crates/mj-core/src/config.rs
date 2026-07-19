@@ -145,6 +145,9 @@ pub struct Proof {
     /// 外部校对命令（§6.8 的 ExternalProofreader，默认关）。
     #[serde(default)]
     pub external: ExternalProof,
+    /// 大模型校对后端（§6.8 的 LlmProofreader，默认关）。
+    #[serde(default)]
+    pub llm: LlmProof,
     #[serde(flatten)]
     pub extra: toml::Table,
 }
@@ -179,6 +182,85 @@ impl Default for ExternalProof {
     }
 }
 
+/// 大模型校对后端配置（§6.8）。
+///
+/// # 两条 `[MUST]` 直接长在类型上
+///
+/// 1. **key 只存环境变量名**。这里根本没有放 key 的字段：想写也写不进来。
+///    真有人写了 `api_key = "sk-..."`，它会被 `extra` 兜住并原样回写（§8 前向兼容），
+///    等于把密钥永久留在 config.toml 里——所以 `LlmProofreader` 启动前会**拒绝**
+///    这种配置并提示改用环境变量，见 `plaintext_secret_field`。
+/// 2. **首次开启要明确同意**。`consented` 默认 false，且 `enabled` 单独一个是不够的：
+///    正文要发给第三方，这事必须是用户点过头的，不能靠改一个 bool 顺带发生。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmProof {
+    pub enabled: bool,
+    /// 用户已看过「正文将发送到第三方服务」的说明并同意（§6.8 `[MUST]`）。
+    pub consented: bool,
+    pub endpoint: String,
+    /// 模型 id。doc.md §8 的示例写的是 `claude-sonnet-4-6`，那一代已经过时；
+    /// 默认取当前的 Opus，用户按自己的成本/延迟偏好改。
+    pub model: String,
+    /// **环境变量名**，不是 key 本身。
+    pub api_key_env: String,
+    /// 每批段落数上限（§6.8 默认 8）。
+    pub batch_paragraphs: usize,
+    /// 每批字数上限（§6.8 默认 2000）。
+    pub batch_chars: usize,
+    pub timeout_ms: u64,
+    /// 单次回复的 token 上限。要留足——思考与 JSON 共用这个预算，
+    /// 给少了就是「思考占满、JSON 截断」，那一批白花钱。
+    pub max_tokens: u32,
+    /// `low` | `medium` | `high` | `xhigh` | `max`。**空串 = 不下发**。
+    ///
+    /// 默认 `medium` 而非 API 默认的 `high`：这是用户按下 F7 后干等的交互路径，
+    /// 一批才 8 段，medium 已足够；要更细的病句就往上调。
+    /// 用老模型（如 Haiku 4.5）时它不认 effort，置空即可。
+    pub effort: String,
+    /// 是否开自适应思考。病句判断吃推理，默认开。
+    ///
+    /// 同样是给老模型留的退路：4.6 之前的模型不认 `thinking: adaptive`，
+    /// 发过去直接 400。换那种模型时连同 `effort` 一起关掉。
+    pub thinking: bool,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl Default for LlmProof {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            consented: false,
+            endpoint: "https://api.anthropic.com/v1/messages".into(),
+            model: "claude-opus-4-8".into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            batch_paragraphs: 8,
+            batch_chars: 2000,
+            timeout_ms: 60_000,
+            max_tokens: 16_000,
+            effort: "medium".into(),
+            thinking: true,
+            extra: toml::Table::new(),
+        }
+    }
+}
+
+impl LlmProof {
+    /// 配置里是否被塞了明文密钥。返回那个字段名。
+    ///
+    /// §6.8 `[MUST]`「不得明文写进 config.toml」。这里不是提醒而是**闸门**：
+    /// 检出就拒跑（见 `proof_llm`），否则 `extra` 的原样回写会让这个 key
+    /// 在 config.toml 里长住，用户还以为自己只是试了一下。
+    pub fn plaintext_secret_field(&self) -> Option<&str> {
+        const BANNED: [&str; 6] = ["api_key", "apikey", "key", "token", "secret", "auth"];
+        self.extra
+            .keys()
+            .map(String::as_str)
+            .find(|k| BANNED.contains(&k.to_ascii_lowercase().as_str()))
+    }
+}
+
 impl Default for Proof {
     fn default() -> Self {
         Self {
@@ -194,6 +276,7 @@ impl Default for Proof {
             short_burst: false,
             fold_below: 0.6,
             external: ExternalProof::default(),
+            llm: LlmProof::default(),
             extra: toml::Table::new(),
         }
     }

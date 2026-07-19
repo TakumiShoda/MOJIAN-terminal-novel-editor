@@ -19,6 +19,8 @@ toml.workspace = true
 rusqlite.workspace = true
 zstd.workspace = true
 blake3.workspace = true
+# 模型校对后端的 HTTP（§6.8）。阻塞式，跑在工作线程——§3 引它就是为这个。
+ureq.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
