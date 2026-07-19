@@ -289,15 +289,6 @@ mod tests {
     use super::*;
     use mj_text::proof::split_paragraphs;
 
-    fn cfg(command: Vec<&str>) -> ExternalProof {
-        ExternalProof {
-            enabled: true,
-            command: command.into_iter().map(|s| s.to_string()).collect(),
-            timeout_ms: 5_000,
-            ..ExternalProof::default()
-        }
-    }
-
     // ---- 字符偏移映射（与平台无关，总是跑）----
 
     #[test]
@@ -397,6 +388,16 @@ mod tests {
     #[cfg(unix)]
     mod process {
         use super::*;
+
+        /// 只有本模块用得上——放在外层的话，Windows 编译时它就是死代码。
+        fn cfg(command: Vec<&str>) -> ExternalProof {
+            ExternalProof {
+                enabled: true,
+                command: command.into_iter().map(|s| s.to_string()).collect(),
+                timeout_ms: 5_000,
+                ..ExternalProof::default()
+            }
+        }
 
         #[test]
         fn reads_issues_from_a_real_process() {
