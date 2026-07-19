@@ -18,13 +18,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::batch::{BatchJob, BatchKind, BatchUndo, Scope};
+use crate::commands::Command;
 use crate::editor::{Action, AutoSave, Buffer, Viewport};
 use crate::event::{AppEvent, EventLoop};
 use crate::screens::character_form::CharacterForm;
 use crate::screens::character_panel::CharacterPanel;
+use crate::screens::command_palette::CommandPalette;
 use crate::screens::completion::Completion;
 use crate::screens::confirm::Confirm;
 use crate::screens::format_preview::{self, FormatPreview};
+use crate::screens::help::{self, Help};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
 use crate::screens::modal::{Modal, ModalKind, ModalStack};
 use crate::screens::proof_panel::{self, ProofPanel};
@@ -397,11 +400,27 @@ impl App {
                 ModalKind::CharacterForm => self.on_key_character_form(code, mods),
                 ModalKind::Characters => self.on_key_character(code, mods),
                 ModalKind::Stats => self.on_key_stats(code),
+                ModalKind::Palette => self.on_key_palette(code, mods),
+                ModalKind::Help => self.on_key_help(code),
             };
         }
 
         // 先处理全局键。
         match code {
+            // Ctrl+P 命令面板（§7.3「最重要的一条」）。
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.modals.push(Modal::Palette(Box::default()));
+                }
+                return Ok(());
+            }
+            // F1 帮助（键位总表，§7.3）。
+            KeyCode::F(1) => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.modals.push(Modal::Help(Box::default()));
+                }
+                return Ok(());
+            }
             // F5 一键排版（当前章，弹预览）——§7.3 键位表。
             KeyCode::F(5) => return self.open_format_preview(),
             // F7 校对当前章（§6.8、§7.3）。
@@ -876,7 +895,9 @@ impl App {
         let snaps = self.history_of(book).list(open.id);
 
         if snaps.is_empty() {
-            self.toast = Some("本章还没有快照（Ctrl+S 保存或 Ctrl+Shift+S 手动打一条）".into());
+            // 这里从前写的是 Ctrl+Shift+S——而那个键在传统键盘模式下**根本按不出来**
+            // （§7.3 的注）。提示里给一个按不了的键，等于让用户以为功能坏了。
+            self.toast = Some("本章还没有快照（Ctrl+S 保存，或 F9 手动打一条）".into());
             return Ok(());
         }
         if let Screen::Workspace(ws) = &mut self.screen {
@@ -1283,6 +1304,186 @@ impl App {
 
         p.refresh(&text);
         self.toast = Some(format!("已替换 {n} 处，Ctrl+Z 撤销 / F8 看快照"));
+        Ok(())
+    }
+
+    // ---- 命令面板与帮助（§7.3）----
+
+    fn on_key_palette(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // Enter 要先把面板关掉再执行命令——否则命令若自己开浮层，
+        // 会叠在一个马上就要消失的面板上。
+        if code == KeyCode::Enter {
+            let cmd = match &self.screen {
+                Screen::Workspace(ws) => ws.modals.palette().and_then(|p| p.selected()),
+                _ => None,
+            };
+            if let Screen::Workspace(ws) = &mut self.screen {
+                ws.modals.close_kind(ModalKind::Palette);
+            }
+            if let Some(cmd) = cmd {
+                return self.run_command(cmd);
+            }
+            return Ok(());
+        }
+
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(p) = ws.modals.palette_mut() else {
+            return Ok(());
+        };
+        match code {
+            KeyCode::Esc => {
+                ws.modals.close_kind(ModalKind::Palette);
+            }
+            KeyCode::Down => p.move_down(),
+            KeyCode::Up => p.move_up(),
+            KeyCode::Backspace => p.backspace(),
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => p.input_char(c),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_key_help(&mut self, code: KeyCode) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return Ok(());
+        };
+        let Some(h) = ws.modals.help_mut() else {
+            return Ok(());
+        };
+        match code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => {
+                ws.modals.close_kind(ModalKind::Help);
+            }
+            KeyCode::Down | KeyCode::Char('j') => h.scroll_down(),
+            KeyCode::Up | KeyCode::Char('k') => h.scroll_up(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// 执行一条命令（§7.3：所有功能都要能从命令面板触达）。
+    ///
+    /// 这里必须覆盖 `commands::COMMANDS` 的每一条——表里有而这里没有的分支，
+    /// 就是一个在面板里点了没反应的命令。`command_coverage` 测试盯着这件事。
+    pub fn run_command(&mut self, cmd: Command) -> anyhow::Result<()> {
+        match cmd {
+            Command::Save => self.save_current(),
+            Command::Snapshot => self.manual_snapshot(),
+            Command::NewChapter => self.new_chapter(),
+            Command::BackToShelf => self.back_to_shelf(),
+            Command::Quit => {
+                self.save_current()?;
+                self.should_quit = true;
+                Ok(())
+            }
+            Command::Undo => {
+                self.editor_undo_redo(true);
+                Ok(())
+            }
+            Command::Redo => {
+                self.editor_undo_redo(false);
+                Ok(())
+            }
+            Command::Find => self.open_search(false),
+            Command::Replace => self.open_search(true),
+            Command::Format => self.open_format_preview(),
+            Command::UndoBatch => self.undo_batch(),
+            Command::Proof => self.open_proof(),
+            Command::History => self.open_history(),
+            Command::Characters => self.open_characters(),
+            Command::Stats => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.modals.push(Modal::Stats(Box::new(Stats::new())));
+                }
+                Ok(())
+            }
+            Command::ToggleTree => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.show_tree = !ws.show_tree;
+                    if !ws.show_tree {
+                        ws.focus = Focus::Editor;
+                    }
+                }
+                Ok(())
+            }
+            Command::Help => {
+                if let Screen::Workspace(ws) = &mut self.screen {
+                    ws.modals.push(Modal::Help(Box::default()));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 撤销/重做当前正文。
+    fn editor_undo_redo(&mut self, undo: bool) {
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return;
+        };
+        let Some(open) = &mut ws.editor else {
+            self.toast = Some("没有打开的章节".into());
+            return;
+        };
+        if undo {
+            open.buffer.undo();
+        } else {
+            open.buffer.redo();
+        }
+        open.word_count = mj_text::count::count(&open.buffer.contents());
+        open.autosave.on_edit(std::time::Instant::now());
+        ws.proof_issues.clear();
+        open.viewport.scroll_to_cursor(&open.buffer);
+    }
+
+    /// Ctrl+N：在当前卷末尾新建一章。
+    ///
+    /// 沿用新建书的做法给占位标题——输入浮层（§7.1 的 `Input`）还没做，
+    /// 而「不能新建章」比「章名要事后改」更挡路。
+    fn new_chapter(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        // 优先落在当前章所属的卷，其次末卷。
+        let vol = ws
+            .editor
+            .as_ref()
+            .and_then(|o| ws.book.find_chapter(o.id))
+            .map(|(v, _)| v.id)
+            .or_else(|| ws.book.volumes.last().map(|v| v.id));
+        let Some(vol) = vol else {
+            self.toast = Some("这本书还没有卷，无处新建章".into());
+            return Ok(());
+        };
+        let last = ws
+            .book
+            .volumes
+            .iter()
+            .find(|v| v.id == vol)
+            .and_then(|v| v.chapters.last())
+            .map(|c| c.id);
+
+        let id = self.store.create_chapter(book, vol, "新章", last)?;
+        // 重载书树，让新章出现在目录里。
+        let reloaded = self.store.load_book(book)?;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.book = reloaded;
+        }
+        self.open_chapter(id)?;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.focus = Focus::Editor;
+        }
+        self.toast = Some("已新建「新章」".into());
+        Ok(())
+    }
+
+    /// 回书架（先保存，§0 禁令 1）。
+    fn back_to_shelf(&mut self) -> anyhow::Result<()> {
+        self.save_current()?;
+        let books = self.store.list_books()?;
+        self.screen = Screen::Shelf(Shelf::new(books));
         Ok(())
     }
 
@@ -2393,6 +2594,21 @@ impl App {
         }
     }
 
+    /// 供测试：是否已请求退出。
+    #[doc(hidden)]
+    pub fn should_quit_for_test(&self) -> bool {
+        self.should_quit
+    }
+
+    /// 供测试：目录树是否显示。
+    #[doc(hidden)]
+    pub fn show_tree_for_test(&self) -> bool {
+        match &self.screen {
+            Screen::Workspace(ws) => ws.show_tree,
+            _ => false,
+        }
+    }
+
     /// 供测试：浮层栈自底向上的种类名（§7.1）。
     #[doc(hidden)]
     pub fn modal_stack_for_test(&self) -> Vec<String> {
@@ -2605,6 +2821,8 @@ impl App {
                         Modal::CharacterForm(fm) => render_character_form(frame, body, fm, theme),
                         Modal::Characters(p) => render_characters(frame, body, p, theme),
                         Modal::Confirm(c) => render_confirm(frame, body, c, theme),
+                        Modal::Palette(p) => render_palette(frame, body, p, theme),
+                        Modal::Help(h) => render_help(frame, body, h, theme),
                         Modal::Stats(st) => {
                             if let Some(rows) = &stats_rows {
                                 render_stats(frame, body, st, rows, &book_title, theme);
@@ -2629,6 +2847,14 @@ impl App {
                 Screen::Shelf(s) => {
                     spans.push(Span::raw(format!(" {} 本书 ", s.books().len())));
                     spans.push(Span::raw("│ Enter 打开 │ n 新建 │ q 退出 "));
+                }
+                Screen::Workspace(ws) if ws.modals.top_is(ModalKind::Palette) => {
+                    spans.push(Span::raw(
+                        " 命令面板 │ 输入筛选 │ ↑↓ 选择 │ Enter 执行 │ Esc 关闭 ",
+                    ));
+                }
+                Screen::Workspace(ws) if ws.modals.top_is(ModalKind::Help) => {
+                    spans.push(Span::raw(" 帮助 │ j/k 滚动 │ Esc 关闭 "));
                 }
                 Screen::Workspace(ws) if ws.modals.contains(ModalKind::CharacterForm) => {
                     let editing = ws.modals.character_form().is_some_and(|f| f.is_editing());
@@ -3585,6 +3811,121 @@ fn render_character_form(
         }
     }
 
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// 命令面板（Ctrl+P，§7.3）。居中小窗：查询行 + 候选列表。
+fn render_palette(frame: &mut ratatui::Frame, area: Rect, p: &mut CommandPalette, theme: &Theme) {
+    // 居中，宽度取 area 的六成（下限 40 上限 70），高度按候选数。
+    let w = (area.width * 6 / 10)
+        .clamp(40.min(area.width), 70)
+        .min(area.width);
+    let rows = p.match_count().clamp(1, 12) as u16;
+    let h = (rows + 4).min(area.height); // 边框 2 + 查询行 1 + 分隔 1
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 3; // 略偏上，符合观感
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" 命令 · {} 条 ", p.match_count()))
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("› ", Style::default().fg(theme.accent)),
+            Span::styled(p.query().to_string(), Style::default().fg(theme.fg)),
+            Span::styled("▏", Style::default().fg(theme.accent)),
+        ])),
+        query_area,
+    );
+
+    p.set_height(list_area.height as usize);
+    let matches = p.matches();
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "没有匹配的命令",
+                Style::default().fg(theme.dim),
+            )),
+            list_area,
+        );
+        return;
+    }
+
+    let key_w = 10usize;
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .skip(p.scroll())
+        .take(list_area.height as usize)
+        .map(|(i, c)| {
+            let selected = i == p.cursor();
+            let base = if selected {
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+            } else {
+                Style::default().fg(theme.fg)
+            };
+            let keys = format!("{:>key_w$}", c.keys);
+            Line::from(vec![
+                Span::styled(format!("{} ", c.name), base),
+                Span::styled(
+                    c.desc.to_string(),
+                    if selected {
+                        base
+                    } else {
+                        Style::default().fg(theme.dim)
+                    },
+                ),
+                Span::styled(keys, Style::default().fg(theme.accent)),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), list_area);
+}
+
+/// 帮助页（F1，§7.3）：键位总表，内容由命令表生成。
+fn render_help(frame: &mut ratatui::Frame, area: Rect, h: &mut Help, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 帮助 · 键位总表（j/k 滚动，Esc 关闭） ")
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    h.set_height(inner.height as usize);
+    let rows = Help::rows();
+    let lines: Vec<Line> = rows
+        .iter()
+        .skip(h.scroll())
+        .take(inner.height as usize)
+        .map(|r| match r {
+            help::HelpRow::Section(s) => Line::from(Span::styled(
+                format!("── {s} ──"),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            help::HelpRow::Blank => Line::raw(""),
+            help::HelpRow::Entry { keys, what } => Line::from(vec![
+                Span::styled(format!("  {keys:<24}"), Style::default().fg(theme.warning)),
+                Span::styled(what.clone(), Style::default().fg(theme.fg)),
+            ]),
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

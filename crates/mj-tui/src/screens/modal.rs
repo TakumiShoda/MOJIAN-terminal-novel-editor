@@ -15,8 +15,8 @@
 //! §7.1 列的浮层里也没有它们。
 
 use super::{
-    CharacterForm, CharacterPanel, Confirm, DiffView, FormatPreview, HistoryPanel, ProofPanel,
-    SearchPanel, Stats,
+    CharacterForm, CharacterPanel, CommandPalette, Confirm, DiffView, FormatPreview, Help,
+    HistoryPanel, ProofPanel, SearchPanel, Stats,
 };
 
 /// 一层浮层。
@@ -34,6 +34,10 @@ pub enum Modal {
     Proof(Box<ProofPanel>),
     Characters(Box<CharacterPanel>),
     CharacterForm(Box<CharacterForm>),
+    /// 命令面板（Ctrl+P，§7.3「最重要的一条」）。
+    Palette(Box<CommandPalette>),
+    /// 帮助页（F1）。
+    Help(Box<Help>),
 }
 
 /// 浮层种类，供日志/测试断言「现在栈上是什么」。
@@ -48,6 +52,8 @@ pub enum ModalKind {
     Proof,
     Characters,
     CharacterForm,
+    Palette,
+    Help,
 }
 
 impl Modal {
@@ -57,7 +63,8 @@ impl Modal {
     /// （浮层栈之前每层都是「替换整个正文区」，不存在这个问题；改成分层叠画后
     /// 就有了）。确认框是居中小窗，自己会 Clear，不算铺满。
     pub fn is_fullscreen(&self) -> bool {
-        !matches!(self, Self::Confirm(_))
+        // 确认框与命令面板是居中小窗，自己会 Clear，压在正文上正是它们该有的样子。
+        !matches!(self, Self::Confirm(_) | Self::Palette(_))
     }
 
     pub fn kind(&self) -> ModalKind {
@@ -71,6 +78,8 @@ impl Modal {
             Self::Proof(_) => ModalKind::Proof,
             Self::Characters(_) => ModalKind::Characters,
             Self::CharacterForm(_) => ModalKind::CharacterForm,
+            Self::Palette(_) => ModalKind::Palette,
+            Self::Help(_) => ModalKind::Help,
         }
     }
 }
@@ -198,6 +207,8 @@ impl ModalStack {
         CharacterForm,
         CharacterForm
     );
+    accessor!(palette, palette_mut, Palette, CommandPalette);
+    accessor!(help, help_mut, Help, Help);
 }
 
 #[cfg(test)]
