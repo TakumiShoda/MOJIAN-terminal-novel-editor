@@ -4,6 +4,7 @@ pub mod app;
 pub mod batch;
 pub mod clipboard;
 pub mod commands;
+pub mod doctor;
 pub mod editor;
 pub mod event;
 pub mod font;

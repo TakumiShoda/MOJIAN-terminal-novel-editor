@@ -82,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Config {
             action: ConfigAction::Check,
         }) => config_check(&ws),
+        Some(Command::Doctor) => doctor(&ws),
         Some(_) => {
             eprintln!("mj: 该子命令尚未实现（见 doc.md §11 里程碑）。");
             std::process::exit(1);
@@ -101,6 +102,25 @@ fn run_tui(ws: &Workspace) -> anyhow::Result<()> {
 
     let store = mj_core::Store::new(ws.clone(), config.clone());
     mj_tui::app::run(store, config)
+}
+
+/// `mj doctor`：探测终端能力并打印报告（doc.md §12.2）。
+///
+/// §2.1 的终端能力表标了 `[VERIFY]`——不得照抄。我们没法在开发机上把
+/// kitty/alacritty/WT 都验一遍，但用户可以：这条命令在**他自己的终端里**跑，
+/// 报的是实际探测结果，拿不准的地方明说是推断。
+fn doctor(ws: &Workspace) -> anyhow::Result<()> {
+    let config = Config::load(&ws.config_file())?;
+    let report = mj_tui::doctor::Report::build(
+        &mj_tui::font::EnvProbe::from_process(),
+        &config.appearance.font_family,
+        config.appearance.font_size,
+    );
+    print!("{}", report.render());
+    println!();
+    println!("workspace: {}", ws.root().display());
+    println!("配置文件:  {}", ws.config_file().display());
+    Ok(())
 }
 
 /// `mj config check`：校验并打印生效值（doc.md §8）。
