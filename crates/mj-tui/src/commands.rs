@@ -17,6 +17,8 @@ pub enum Command {
     NewChapter,
     BackToShelf,
     Export,
+    NextChapter,
+    PrevChapter,
     Quit,
     // 编辑
     Undo,
@@ -49,6 +51,8 @@ impl Command {
             Self::NewChapter => "new_chapter",
             Self::BackToShelf => "back_to_shelf",
             Self::Export => "export",
+            Self::NextChapter => "next_chapter",
+            Self::PrevChapter => "prev_chapter",
             Self::Quit => "quit",
             Self::Undo => "undo",
             Self::Redo => "redo",
@@ -178,6 +182,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "导出全书",
         desc: "把整本书导出成 Markdown，存到工作区根目录",
         keys: "",
+        category: Category::File,
+    },
+    CommandSpec {
+        cmd: Command::NextChapter,
+        name: "下一章",
+        desc: "跳到下一章（需终端支持 kitty 键盘协议，否则用命令面板）",
+        keys: "Ctrl+Tab",
+        category: Category::File,
+    },
+    CommandSpec {
+        cmd: Command::PrevChapter,
+        name: "上一章",
+        desc: "跳到上一章（需终端支持 kitty 键盘协议，否则用命令面板）",
+        keys: "Ctrl+Shift+Tab",
         category: Category::File,
     },
     CommandSpec {

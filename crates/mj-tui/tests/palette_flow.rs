@@ -155,6 +155,43 @@ fn new_chapter_command_creates_one_on_disk() {
     assert_eq!(n, 2, "应在磁盘上多出一章");
 }
 
+/// 上/下一章按**全书阅读顺序**跨卷走——读者读的是一条线。
+///
+/// 这两条对应 §7.3 的 Ctrl+Tab，那个键位要终端支持 kitty 协议才到得了程序；
+/// 命令本身在任何终端下都能从命令面板触达，故这里直接测命令。
+#[test]
+fn chapter_navigation_crosses_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = Workspace::resolve(Some(dir.path().to_path_buf())).unwrap();
+    ws.ensure_layout().unwrap();
+    let mut store = Store::new(ws, Config::default());
+    let book = store.create_book("书", "作者").unwrap();
+    let v1 = store.create_volume(book.id, "第一卷", None).unwrap();
+    let c1 = store.create_chapter(book.id, v1, "一", None).unwrap();
+    let c2 = store.create_chapter(book.id, v1, "二", Some(c1)).unwrap();
+    let v2 = store.create_volume(book.id, "第二卷", Some(v1)).unwrap();
+    let c3 = store.create_chapter(book.id, v2, "三", None).unwrap();
+
+    let ws = Workspace::resolve(Some(dir.path().to_path_buf())).unwrap();
+    let mut app = App::new(Store::new(ws, Config::default()), Config::default()).unwrap();
+    app.open_first_book_for_demo().unwrap();
+    app.open_chapter_for_test(c1).unwrap();
+
+    app.run_command(Command::NextChapter).unwrap();
+    assert_eq!(app.current_chapter_for_test(), Some(c2));
+
+    // 卷末再往后，应当跨进下一卷。
+    app.run_command(Command::NextChapter).unwrap();
+    assert_eq!(app.current_chapter_for_test(), Some(c3), "该跨到第二卷");
+
+    // 最后一章再往后：停住并提示，不该绕回开头。
+    app.run_command(Command::NextChapter).unwrap();
+    assert_eq!(app.current_chapter_for_test(), Some(c3));
+
+    app.run_command(Command::PrevChapter).unwrap();
+    assert_eq!(app.current_chapter_for_test(), Some(c2), "往回也要跨卷");
+}
+
 #[test]
 fn toggle_tree_command_flips_it() {
     let f = setup();

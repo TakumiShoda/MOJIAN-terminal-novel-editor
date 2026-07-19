@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod editor;
 pub mod event;
 pub mod font;
+pub mod keyboard;
 pub mod keymap;
 pub mod panic;
 pub mod screens;

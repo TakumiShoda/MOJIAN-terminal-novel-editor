@@ -737,6 +737,12 @@ Workspace = Tree | Editor 双焦点 + 可选右侧面板 + 底部状态栏
 > 一个永远不触发的键位比没有更糟——用户会以为功能坏了。故 M4 起以 `F9` 作为
 > 打快照的实际入口；`Ctrl+Shift+S` 的分支保留，M6 开了协议它自然就活。
 > 同类问题还有 `Ctrl+Tab`（上/下一章），M6 一并处理。
+>
+> **M6 已处理**：启动时探测（`supports_keyboard_enhancement`），支持则推入
+> `DISAMBIGUATE_ESCAPE_CODES`，`Ctrl+Shift+S` 与 `Ctrl+Tab` 随之可用；不支持
+> 静默降级，`F9` 与命令面板始终有效。退出与 panic 路径都会弹栈——留在增强模式
+> 会让用户的 shell 按键行为全不对，与字体变形是同一类事故。
+> 实际是否开启以 `mj doctor` 的「键盘协议」一项为准（那是真探测，不是按终端名猜）。
 
 ### 7.4 事件循环
 

@@ -86,16 +86,23 @@ impl Report {
             note: "终端不回话，无从确认是否真放进了剪贴板；ssh 场景下也能用".into(),
         });
 
+        // 键盘协议这一项是**真探测**（向终端发查询并读回答），不是按终端名猜。
+        // 探测得在真终端里才有意义；管道/重定向下会得到 false，如实报即可。
+        let kbd = crate::keyboard::probe();
         findings.push(Finding {
             item: "键盘协议".into(),
-            value: if matches!(kind, TerminalKind::Kitty | TerminalKind::WezTerm) {
-                "可能支持 kitty 协议".into()
+            value: if kbd {
+                "kitty 协议（实测支持）".into()
             } else {
                 "传统模式".into()
             },
-            note: "传统模式下 Ctrl+Shift+S、Ctrl+Tab 到不了程序（终端不编码 Shift），\
-                   故打快照用 F9"
-                .into(),
+            note: if kbd {
+                "Ctrl+Shift+S 打快照、Ctrl+Tab 换章可用；F9 同样有效".into()
+            } else {
+                "Ctrl+Shift+S、Ctrl+Tab 到不了程序（终端不编码 Shift），\
+                 故打快照用 F9、换章用命令面板"
+                    .into()
+            },
         });
 
         let snippet = if caps.is_empty() {

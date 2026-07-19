@@ -202,6 +202,15 @@ impl App {
         &self.theme
     }
 
+    /// 告知已开启 kitty 键盘协议——首屏提示一句，好让用户知道那两个键现在能用了。
+    #[doc(hidden)]
+    pub fn note_keyboard_protocol(&mut self) {
+        if self.toast.is_none() {
+            self.toast =
+                Some("已开启 kitty 键盘协议：Ctrl+Shift+S 打快照、Ctrl+Tab 换章可用".into());
+        }
+    }
+
     /// 打开某书的索引。
     ///
     /// 索引是缓存不是真相（§0 禁令 3）：连重建都失败（磁盘满/只读）时
@@ -1398,6 +1407,8 @@ impl App {
             }
             Command::Appearance => self.open_settings(),
             Command::Export => self.export_book(),
+            Command::NextChapter => self.step_chapter(1),
+            Command::PrevChapter => self.step_chapter(-1),
             Command::FocusMode => {
                 self.focus_mode = !self.focus_mode;
                 if let Screen::Workspace(ws) = &mut self.screen {
@@ -1589,6 +1600,44 @@ impl App {
             ws.focus = Focus::Editor;
         }
         self.toast = Some("已新建「新章」".into());
+        Ok(())
+    }
+
+    /// 上/下一章（§7.3 的 Ctrl+Tab）。`delta` 为 +1/-1。
+    ///
+    /// 按**全书阅读顺序**跨卷走，而不是只在当前卷里打转——读者读的是一条线，
+    /// 翻到卷末自然该进下一卷。
+    fn step_chapter(&mut self, delta: i32) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let all: Vec<ChapterId> = ws
+            .book
+            .volumes
+            .iter()
+            .flat_map(|v| &v.chapters)
+            .map(|c| c.id)
+            .collect();
+        let Some(current) = ws.editor.as_ref().map(|o| o.id) else {
+            self.toast = Some("没有打开的章节".into());
+            return Ok(());
+        };
+        let Some(idx) = all.iter().position(|c| *c == current) else {
+            return Ok(());
+        };
+        let next = idx as i32 + delta;
+        if next < 0 || next as usize >= all.len() {
+            self.toast = Some(if delta > 0 {
+                "已经是最后一章".into()
+            } else {
+                "已经是第一章".into()
+            });
+            return Ok(());
+        }
+        self.open_chapter(all[next as usize])?;
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.focus = Focus::Editor;
+        }
         Ok(())
     }
 
@@ -4384,10 +4433,19 @@ fn border_style(focused: bool, theme: &Theme) -> Style {
 pub fn run(store: Store, config: Config) -> anyhow::Result<()> {
     let mut app = App::new(store, config)?;
     let mut term = ratatui::try_init()?;
-    let events = EventLoop::spawn();
 
+    // kitty 键盘协议：探测到就开，让 Ctrl+Shift+S / Ctrl+Tab 到得了程序（§2.3、§7.3）。
+    // 不支持时静默降级——缺的只是两个键位，不该拦着人写字。
+    // 必须在起窗之后开：它是写给终端的转义序列，得在 alternate screen 里发。
+    if crate::keyboard::enable() {
+        app.note_keyboard_protocol();
+    }
+
+    let events = EventLoop::spawn();
     let result = app.run_loop(&mut term, &events);
 
+    // 顺序要紧：先把我们改过的终端状态收回来，再交还给 ratatui 复原。
+    crate::keyboard::disable();
     crate::font::emit_reset_sequence();
     ratatui::try_restore()?;
     result

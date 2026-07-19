@@ -110,8 +110,12 @@ pub fn install(crash_dir: PathBuf, dump: CrashDump) {
     }));
 }
 
-/// 恢复终端：关 raw mode、离开 alternate screen、重置字体。
+/// 恢复终端：关 raw mode、离开 alternate screen、重置字体、退出键盘增强模式。
 fn restore_terminal() {
+    // 键盘增强模式必须弹掉——留着的话用户的 shell 之后按键行为全不对，
+    // 与字体变形是同一类事故。同样直发字节：panic 时 crossterm 可能正持着锁。
+    crate::keyboard::emit_pop_sequence();
+
     // 字体重置必须在离开 alternate screen 之前发——OSC 序列要送到宿主终端。
     // FontController 在 panic 上下文里不可用（可能正持锁），故直接发原始序列。
     // 见 doc.md §2.1：仅对支持的终端有效，其余无副作用。
