@@ -124,6 +124,14 @@ impl Workspace {
         self.root.join("books")
     }
 
+    /// 工作区级回收站（§0：破坏性操作可撤销）。
+    ///
+    /// 删书用它——书没了就没有 `book_dir/trash` 可挂了，只能挂到工作区根下。
+    /// 卷/章/角色仍进各自书内的 `trash/`（跟书一起删、一起恢复，语义更顺）。
+    pub fn trash_dir(&self) -> PathBuf {
+        self.root.join("trash")
+    }
+
     /// panic 时未保存缓冲的落盘处（doc.md §9）。
     pub fn crash_dir(&self) -> PathBuf {
         self.root.join("crash")

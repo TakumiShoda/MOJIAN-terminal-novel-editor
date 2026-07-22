@@ -411,6 +411,152 @@ impl Store {
         Ok(id)
     }
 
+    // ---- 结构管理：重命名 / 删除 / 移动（§6.1、§6.2）----
+    //
+    // 一条铁律（§6.2 line 319 [MUST]）：**改名/移动只动元数据与文件名，
+    // 绝不碰正文、绝不重新生成 ID**。ID 是稳定真相，正文是用户的手稿——
+    // 一次改名把正文动了，就是最不该发生的那种事（§0 禁令 1）。
+
+    /// 给书改名。书目录名就是 BookId，不带 slug，故只改 `book.toml` 里的标题，
+    /// 不搬任何目录。
+    pub fn rename_book(&mut self, id: BookId, new_title: &str) -> Result<()> {
+        let mut b = self.load_book(id)?;
+        b.title = new_title.to_string();
+        self.save_book_meta(&b)
+    }
+
+    /// 给卷改名。卷目录名是 `{order:03}-{slug}`，改名要连目录一起搬——
+    /// 目录里的章跟着走，它们的 id 与正文都不受影响（路径下次扫盘重新导出）。
+    pub fn rename_volume(&mut self, book: BookId, vol: VolumeId, new_title: &str) -> Result<()> {
+        let b = self.load_book(book)?;
+        let v = b
+            .volumes
+            .iter()
+            .find(|v| v.id == vol)
+            .ok_or(Error::VolumeNotFound { id: vol })?;
+        let old_dir = self.volume_dir(book, v);
+
+        let mut nv = v.clone();
+        nv.title = new_title.to_string();
+        let new_dir = self.volume_dir(book, &nv);
+
+        if old_dir != new_dir {
+            std::fs::rename(&old_dir, &new_dir).map_err(|source| Error::Io {
+                path: old_dir,
+                source,
+            })?;
+        }
+        // volume.toml 落到（可能已改名的）新目录里。
+        self.save_volume_meta(book, &nv)
+    }
+
+    /// 给章改名。改 front matter 的标题，并把文件名的 slug 部分跟着换掉，
+    /// **order 前缀、id、正文全不动**（§6.2 [MUST]）。受损章拒绝改名。
+    pub fn rename_chapter(&mut self, book: BookId, ch: ChapterId, new_title: &str) -> Result<()> {
+        let path = self.find_chapter_path(book, ch)?;
+        let raw = read_to_string(&path)?;
+        let mut file = ChapterFile::parse(&raw, ch).map_err(|e| Error::ChapterDamaged {
+            path: path.clone(),
+            message: e.to_string(),
+        })?;
+
+        file.meta.title = new_title.to_string();
+        file.meta.updated = Some(crate::now_rfc3339());
+        self.write_chapter_file(&path, &file)?;
+
+        // 文件名 = `{order:04}-{slug}.md`，order 前缀保持，只换 slug。
+        let order = order_from_filename(&path).unwrap_or(0);
+        let new_path = path.with_file_name(format!("{:04}-{}.md", order, slugify(new_title)));
+        if new_path != path {
+            std::fs::rename(&path, &new_path).map_err(|source| Error::Io { path, source })?;
+        }
+        Ok(())
+    }
+
+    /// 删章：移到书内 `trash/chapters/`（§0 可撤销）。
+    pub fn delete_chapter(&self, book: BookId, ch: ChapterId) -> Result<()> {
+        let src = self.find_chapter_path(book, ch)?;
+        let trash = self.book_dir(book).join("trash").join("chapters");
+        std::fs::create_dir_all(&trash).map_err(|source| Error::Io {
+            path: trash.clone(),
+            source,
+        })?;
+        let dst = trash.join(format!("{ch}.md"));
+        std::fs::rename(&src, &dst).map_err(|source| Error::Io { path: src, source })
+    }
+
+    /// 删卷：整个卷目录（连同其中的章）移到书内 `trash/volumes/<卷id>/`。
+    pub fn delete_volume(&self, book: BookId, vol: VolumeId) -> Result<()> {
+        let b = self.load_book(book)?;
+        let v = b
+            .volumes
+            .iter()
+            .find(|v| v.id == vol)
+            .ok_or(Error::VolumeNotFound { id: vol })?;
+        let src = self.volume_dir(book, v);
+        let trash = self.book_dir(book).join("trash").join("volumes");
+        std::fs::create_dir_all(&trash).map_err(|source| Error::Io {
+            path: trash.clone(),
+            source,
+        })?;
+        let dst = trash.join(vol.to_string());
+        std::fs::rename(&src, &dst).map_err(|source| Error::Io { path: src, source })
+    }
+
+    /// 删书：整本移到工作区级 `trash/books/<书id>/`（§0 可撤销）。
+    pub fn delete_book(&self, id: BookId) -> Result<()> {
+        let src = self.book_dir(id);
+        if !src.exists() {
+            return Err(Error::Io {
+                path: src.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "书不存在"),
+            });
+        }
+        let trash = self.ws.trash_dir().join("books");
+        std::fs::create_dir_all(&trash).map_err(|source| Error::Io {
+            path: trash.clone(),
+            source,
+        })?;
+        let dst = trash.join(id.to_string());
+        std::fs::rename(&src, &dst).map_err(|source| Error::Io { path: src, source })
+    }
+
+    /// 移动章：调到 `target_vol` 里、排在 `after` 之后（`after` 为 None 排到卷首）。
+    ///
+    /// 卷内重排与跨卷移动是同一件事——都是「换个卷、换个 order、把文件搬过去」。
+    /// id、标题、正文全不动，只有 order 前缀和所在目录变（§6.2 [MUST]）。
+    pub fn move_chapter(
+        &mut self,
+        book: BookId,
+        ch: ChapterId,
+        target_vol: VolumeId,
+        after: Option<ChapterId>,
+    ) -> Result<()> {
+        let src = self.find_chapter_path(book, ch)?;
+        // 取这一章的标题（文件名 slug 要用它重建）。受损章不给移。
+        let raw = read_to_string(&src)?;
+        let file = ChapterFile::parse(&raw, ch).map_err(|e| Error::ChapterDamaged {
+            path: src.clone(),
+            message: e.to_string(),
+        })?;
+        let title = file.meta.title.clone();
+
+        let mut b = self.load_book(book)?;
+        let order = self.next_chapter_order(&mut b, book, target_vol, after)?;
+        // 目标卷可能在 next_chapter_order 的 renumber 里被重排过，重新加载取准目录。
+        let dst = self.chapter_path(book, target_vol, order, &title)?;
+        if dst == src {
+            return Ok(());
+        }
+        if let Some(dir) = dst.parent() {
+            std::fs::create_dir_all(dir).map_err(|source| Error::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::rename(&src, &dst).map_err(|source| Error::Io { path: src, source })
+    }
+
     // ---- 角色卡（§6.7）----
 
     fn characters_dir(&self, book: BookId) -> PathBuf {
