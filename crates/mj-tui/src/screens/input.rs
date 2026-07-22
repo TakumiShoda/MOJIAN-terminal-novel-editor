@@ -10,11 +10,21 @@
 use mj_core::id::{BookId, ChapterId, VolumeId};
 
 /// 提交后要干的事。带上目标 id——浮层不认得 store，动作归 app。
+///
+/// 删除也走这个浮层：不是让人敲名字，而是**敲字确认**——书要照 §6.1 [MUST]
+/// 输入书名，卷/章输入 `y`。删除可撤销（软删进 trash），但一键让一整章消失
+/// 还是太惊，故都要当面敲一下确认。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputIntent {
     RenameBook(BookId),
     RenameVolume(VolumeId),
     RenameChapter(ChapterId),
+    /// 删书：确认串是书名本身（§6.1 [MUST]「输入书名确认」）。
+    DeleteBook(BookId),
+    /// 删卷：确认串是 `y`。
+    DeleteVolume(VolumeId),
+    /// 删章：确认串是 `y`。
+    DeleteChapter(ChapterId),
 }
 
 pub struct Input {

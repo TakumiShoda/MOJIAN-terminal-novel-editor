@@ -455,6 +455,17 @@ impl App {
                     self.start_rename(title, InputIntent::RenameBook(id));
                 }
             }
+            // `d`：删选中的书。§6.1 [MUST]：必须输入书名确认——一本书是几十万字，
+            // 敲个 y 太轻。
+            KeyCode::Char('d') => {
+                if let Some(book) = shelf.selected() {
+                    let (title, id) = (book.title.clone(), book.id);
+                    self.start_delete_confirm(
+                        format!("删除《{title}》？请输入完整书名以确认"),
+                        InputIntent::DeleteBook(id),
+                    );
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2376,6 +2387,11 @@ impl App {
         self.input = Some(Input::new(rename_prompt(intent), title, intent));
     }
 
+    /// 发起删除确认：不预填，等用户敲确认串（书名 / `y`）。
+    fn start_delete_confirm(&mut self, prompt: impl Into<String>, intent: InputIntent) {
+        self.input = Some(Input::new(prompt, "", intent));
+    }
+
     /// 输入框吃键。返回 true 表示这一键被输入框消费了（`on_key` 据此提前返回）。
     fn input_handles_key(&mut self, code: KeyCode) -> anyhow::Result<bool> {
         let Some(input) = &mut self.input else {
@@ -2389,12 +2405,24 @@ impl App {
             KeyCode::Char(c) => input.input_char(c),
             KeyCode::Enter => {
                 if let Some(input) = self.input.take() {
-                    self.submit_rename(input.value().trim(), input.intent())?;
+                    self.submit_input(input.value().trim(), input.intent())?;
                 }
             }
             _ => {}
         }
         Ok(true)
+    }
+
+    /// 输入框提交：按 intent 分派——改名还是删除。
+    fn submit_input(&mut self, value: &str, intent: InputIntent) -> anyhow::Result<()> {
+        match intent {
+            InputIntent::RenameBook(_)
+            | InputIntent::RenameVolume(_)
+            | InputIntent::RenameChapter(_) => self.submit_rename(value, intent),
+            InputIntent::DeleteBook(_)
+            | InputIntent::DeleteVolume(_)
+            | InputIntent::DeleteChapter(_) => self.submit_delete(value, intent),
+        }
     }
 
     /// 落地一次改名：调 store，刷新内存里的书树/书架。
@@ -2414,10 +2442,11 @@ impl App {
                 Screen::Workspace(ws) => self.store.rename_chapter(ws.book.id, id, name),
                 _ => Ok(()),
             },
+            _ => Ok(()),
         };
         match result {
             Ok(()) => {
-                self.refresh_after_rename();
+                self.refresh_after_structure_change();
                 self.toast = Some(format!("已重命名为「{name}」"));
             }
             Err(e) => self.toast = Some(format!("改名失败：{e}")),
@@ -2425,8 +2454,63 @@ impl App {
         Ok(())
     }
 
-    /// 磁盘上的名字改了，把内存里的视图（书树或书架）同步过来。
-    fn refresh_after_rename(&mut self) {
+    /// 落地一次删除。确认串不符就什么都不做（§6.1 [MUST]：删书要输书名）。
+    fn submit_delete(&mut self, typed: &str, intent: InputIntent) -> anyhow::Result<()> {
+        let yes = typed.eq_ignore_ascii_case("y");
+        let (result, gone) = match intent {
+            InputIntent::DeleteBook(id) => {
+                // 确认串必须**正好等于书名**，不是随便一个 y。
+                let title = self.store.load_book(id).ok().map(|b| b.title);
+                if title.as_deref() != Some(typed) {
+                    self.toast = Some("书名不符，未删除".into());
+                    return Ok(());
+                }
+                (self.store.delete_book(id), None)
+            }
+            InputIntent::DeleteVolume(id) => {
+                if !yes {
+                    self.toast = Some("已取消，未删除".into());
+                    return Ok(());
+                }
+                let book = match &self.screen {
+                    Screen::Workspace(ws) => ws.book.id,
+                    _ => return Ok(()),
+                };
+                (self.store.delete_volume(book, id), None)
+            }
+            InputIntent::DeleteChapter(id) => {
+                if !yes {
+                    self.toast = Some("已取消，未删除".into());
+                    return Ok(());
+                }
+                let book = match &self.screen {
+                    Screen::Workspace(ws) => ws.book.id,
+                    _ => return Ok(()),
+                };
+                (self.store.delete_chapter(book, id), Some(id))
+            }
+            _ => return Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                // 删的正是打开着的那一章，就把编辑器合上——不能对着已进 trash 的文件。
+                if let Some(ch) = gone
+                    && let Screen::Workspace(ws) = &mut self.screen
+                    && ws.editor.as_ref().is_some_and(|o| o.id == ch)
+                {
+                    ws.editor = None;
+                    ws.focus = Focus::Tree;
+                }
+                self.refresh_after_structure_change();
+                self.toast = Some("已删除，可在 trash 里找回".into());
+            }
+            Err(e) => self.toast = Some(format!("删除失败：{e}")),
+        }
+        Ok(())
+    }
+
+    /// 磁盘上的结构变了（改名/删除），把内存里的视图（书树或书架）同步过来。
+    fn refresh_after_structure_change(&mut self) {
         match &self.screen {
             Screen::Workspace(ws) => {
                 let book = ws.book.id;
@@ -2437,7 +2521,7 @@ impl App {
                 }
             }
             Screen::Shelf(shelf) => {
-                // 保住当前选中项，别让改完名光标跳走。
+                // 保住当前选中项，别让改完/删完光标跳走。
                 let keep = shelf.selected_id();
                 if let Ok(books) = self.store.list_books()
                     && let Screen::Shelf(shelf) = &mut self.screen
@@ -2853,6 +2937,27 @@ impl App {
                     } else {
                         self.start_rename(title, InputIntent::RenameChapter(id));
                     }
+                }
+                None => {}
+            },
+            // `d`：删选中的卷/章（软删到 trash，删前敲 y 确认）（§6.2 [MUST]）。
+            KeyCode::Char('d') => match ws.tree.selected(&ws.book) {
+                Some(Row::Volume {
+                    id,
+                    title,
+                    chapter_count,
+                    ..
+                }) => {
+                    self.start_delete_confirm(
+                        format!("删除卷《{title}》（含 {chapter_count} 章）？输入 y 确认"),
+                        InputIntent::DeleteVolume(id),
+                    );
+                }
+                Some(Row::Chapter { id, title, .. }) => {
+                    self.start_delete_confirm(
+                        format!("删除章《{title}》？输入 y 确认"),
+                        InputIntent::DeleteChapter(id),
+                    );
                 }
                 None => {}
             },
@@ -4309,12 +4414,15 @@ fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob, theme: &
 }
 
 /// 宽范围作业的确认框。居中浮层，盖在底下那层上。
-/// 输入框的标题，按 intent 定。
+/// 改名输入框的标题，按 intent 定。删除的提示语由 `start_delete_confirm`
+/// 各自带上（要嵌名字/章数），不走这里。
 fn rename_prompt(intent: InputIntent) -> &'static str {
     match intent {
         InputIntent::RenameBook(_) => "重命名书",
         InputIntent::RenameVolume(_) => "重命名卷",
         InputIntent::RenameChapter(_) => "重命名章",
+        // 删除不经这个函数——真走到了给个通用词，胜过 panic。
+        _ => "确认",
     }
 }
 
