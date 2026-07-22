@@ -60,13 +60,21 @@ mj          # ② 进书架。空的？按 n 新建一本书，Enter 打开
 
 记不住键就按 `Ctrl+P`——所有功能都能从命令面板搜到并触发。
 
-### 无头子命令（不进界面，给脚本用）
+### 无头子命令（不进界面，给脚本 / CI 用）
 
 ```bash
+mj count [--book <id>] [--json]         # 统计字数（含标点 / 不含标点 / 纯汉字…）
+mj format <path> [--check]              # 排版一个文件；--check 只报告不改，需排版则退出码非零
 mj export <书名或id> --format txt|md|epub -o out.epub   # 导出
-mj import 稿子.md                                        # 从 Markdown 导入成一本新书
-mj config check                                          # 校验配置文件
+mj import 稿子.md                        # 从 Markdown 导入成一本新书
+mj history list <章名或id>               # 列一章的快照链
+mj config check                          # 校验配置文件
+mj doctor                                # 探测终端能力
 ```
+
+`mj format --check` 照 rustfmt 的规矩——干净就退 0、需要排版就退非零，直接塞进
+提交钩子或 CI 就能守住全书的排版规范。指向带 `+++` 头的章节文件时只排正文、
+头部原样不动。
 
 ---
 
