@@ -76,6 +76,9 @@ string_slice = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# 去掉符号表，发布的二进制小一截（bundled sqlite 本就占地方）。
+# 崩溃恢复靠的是 panic hook dump 未保存的正文，不是符号丰富的栈回溯，故无损。
+strip = true
 
 # 正文是用户的手稿：release 下也保留溢出检查，宁可 panic（有 hook 兜底 dump）也不要静默算错字数/偏移。
 overflow-checks = true
