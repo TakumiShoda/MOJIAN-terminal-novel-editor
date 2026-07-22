@@ -32,6 +32,7 @@ use crate::screens::consent::Consent;
 use crate::screens::format_preview::{self, FormatPreview};
 use crate::screens::help::{self, Help};
 use crate::screens::history_panel::{DiffView, HistoryPanel, LineKind};
+use crate::screens::input::{Input, InputIntent};
 use crate::screens::modal::{Modal, ModalKind, ModalStack};
 use crate::screens::proof_panel::{self, ProofPanel};
 use crate::screens::search_panel::{self, SearchPanel};
@@ -173,6 +174,12 @@ pub struct App {
     events_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
     /// 正按着分隔条拖（§13）。
     dragging_divider: bool,
+    /// 活动中的单行输入框（改名，§6.1/§6.2）。
+    ///
+    /// 放 App 顶层而非浮层栈：改书名是在**书架**上做的，而书架没有浮层栈；
+    /// 一个顶层字段能同时盖住书架与工作区，比给两处各接一套输入省事得多。
+    /// 它一旦是 Some，就抢在所有屏幕之前吃键（见 `on_key`）。
+    input: Option<Input>,
 }
 
 /// 在跑的那趟模型校对。
@@ -226,6 +233,7 @@ impl App {
             llm_job: None,
             events_tx: None,
             dragging_divider: false,
+            input: None,
         })
     }
 
@@ -401,6 +409,12 @@ impl App {
             return Ok(());
         }
 
+        // 输入框活着时，它抢在所有屏幕之前吃键——正在改名，`d`/`r`/`j` 都该是
+        // 往名字里打的字，而不是触发别的动作。
+        if self.input.is_some() {
+            return self.input_handles_key(code).map(|_| ());
+        }
+
         // 模型校对在飞的时候，Esc 就是「掐掉它」——弹出的提示是这么许诺的（§7）。
         // 掐完 Esc 恢复原义（关浮层 / 取消选区 / 回书架）。
         if code == KeyCode::Esc
@@ -434,6 +448,13 @@ impl App {
                 }
             }
             KeyCode::Char('n') => self.new_book()?,
+            // `r`：给选中的书改名（§6.1 [MUST]）。
+            KeyCode::Char('r') => {
+                if let Some(book) = shelf.selected() {
+                    let (title, id) = (book.title.clone(), book.id);
+                    self.start_rename(title, InputIntent::RenameBook(id));
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2348,6 +2369,85 @@ impl App {
         });
     }
 
+    // ---- 输入框：改名（§6.1、§6.2）----
+
+    /// 发起改名：预填原名，开输入框。
+    fn start_rename(&mut self, title: impl Into<String>, intent: InputIntent) {
+        self.input = Some(Input::new(rename_prompt(intent), title, intent));
+    }
+
+    /// 输入框吃键。返回 true 表示这一键被输入框消费了（`on_key` 据此提前返回）。
+    fn input_handles_key(&mut self, code: KeyCode) -> anyhow::Result<bool> {
+        let Some(input) = &mut self.input else {
+            return Ok(false);
+        };
+        match code {
+            KeyCode::Esc => {
+                self.input = None;
+            }
+            KeyCode::Backspace => input.backspace(),
+            KeyCode::Char(c) => input.input_char(c),
+            KeyCode::Enter => {
+                if let Some(input) = self.input.take() {
+                    self.submit_rename(input.value().trim(), input.intent())?;
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// 落地一次改名：调 store，刷新内存里的书树/书架。
+    fn submit_rename(&mut self, name: &str, intent: InputIntent) -> anyhow::Result<()> {
+        if name.is_empty() {
+            self.toast = Some("名字不能为空，未改动".into());
+            return Ok(());
+        }
+        // 书 id：改书名在书架上，用 intent 自带的；改卷/章在工作区，用当前书。
+        let result = match intent {
+            InputIntent::RenameBook(id) => self.store.rename_book(id, name),
+            InputIntent::RenameVolume(id) => match &self.screen {
+                Screen::Workspace(ws) => self.store.rename_volume(ws.book.id, id, name),
+                _ => Ok(()),
+            },
+            InputIntent::RenameChapter(id) => match &self.screen {
+                Screen::Workspace(ws) => self.store.rename_chapter(ws.book.id, id, name),
+                _ => Ok(()),
+            },
+        };
+        match result {
+            Ok(()) => {
+                self.refresh_after_rename();
+                self.toast = Some(format!("已重命名为「{name}」"));
+            }
+            Err(e) => self.toast = Some(format!("改名失败：{e}")),
+        }
+        Ok(())
+    }
+
+    /// 磁盘上的名字改了，把内存里的视图（书树或书架）同步过来。
+    fn refresh_after_rename(&mut self) {
+        match &self.screen {
+            Screen::Workspace(ws) => {
+                let book = ws.book.id;
+                if let Ok(b) = self.store.load_book(book)
+                    && let Screen::Workspace(ws) = &mut self.screen
+                {
+                    ws.book = b;
+                }
+            }
+            Screen::Shelf(shelf) => {
+                // 保住当前选中项，别让改完名光标跳走。
+                let keep = shelf.selected_id();
+                if let Ok(books) = self.store.list_books()
+                    && let Screen::Shelf(shelf) = &mut self.screen
+                {
+                    shelf.reload(books, keep);
+                }
+            }
+        }
+    }
+
     /// 同意框上的按键。默认停在「不同意」。
     fn on_key_consent(&mut self, code: KeyCode) -> anyhow::Result<()> {
         let confirmed = match code {
@@ -2740,6 +2840,22 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => ws.tree.move_down(&ws.book),
             KeyCode::Up | KeyCode::Char('k') => ws.tree.move_up(),
             KeyCode::Char(' ') => ws.tree.toggle_check(&ws.book),
+            // `r`：给选中的卷/章改名（§6.2 [MUST]、§7.1 树内 `r`）。
+            KeyCode::Char('r') => match ws.tree.selected(&ws.book) {
+                Some(Row::Volume { id, title, .. }) => {
+                    self.start_rename(title, InputIntent::RenameVolume(id));
+                }
+                Some(Row::Chapter {
+                    id, title, damaged, ..
+                }) => {
+                    if damaged {
+                        self.toast = Some("该章元数据损坏，改名前需先人工修复".into());
+                    } else {
+                        self.start_rename(title, InputIntent::RenameChapter(id));
+                    }
+                }
+                None => {}
+            },
             KeyCode::Left => ws.tree.toggle(&ws.book),
             KeyCode::Right | KeyCode::Enter => {
                 match ws.tree.selected(&ws.book) {
@@ -3199,6 +3315,36 @@ impl App {
         })
     }
 
+    /// 供测试：把焦点切到目录树（`open_book` 默认打开首章、焦点落在编辑器）。
+    #[doc(hidden)]
+    pub fn focus_tree_for_test(&mut self) {
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.focus = Focus::Tree;
+        }
+    }
+
+    /// 供测试：输入框当前文本（None = 没开输入框）。
+    #[doc(hidden)]
+    pub fn input_value_for_test(&self) -> Option<String> {
+        self.input.as_ref().map(|i| i.value().to_string())
+    }
+
+    /// 供测试：当前书里所有卷/章的标题，按树的顺序（卷，然后它的章）。
+    #[doc(hidden)]
+    pub fn tree_titles_for_test(&self) -> Vec<String> {
+        match &self.screen {
+            Screen::Workspace(ws) => {
+                let mut out = Vec::new();
+                for v in &ws.book.volumes {
+                    out.push(v.title.clone());
+                    out.extend(v.chapters.iter().map(|c| c.title.clone()));
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// 供测试：当前侧栏宽度（§13 拖分隔条）。
     #[doc(hidden)]
     pub fn tree_width_for_test(&self) -> u16 {
@@ -3509,6 +3655,11 @@ impl App {
                     }
                 }
             }
+        }
+
+        // 输入框画在最上层，盖住书架/工作区都行（改书名在书架、改章名在工作区）。
+        if let Some(input) = &self.input {
+            render_input(frame, body, input, &self.theme);
         }
 
         self.render_status(frame, status);
@@ -4158,6 +4309,45 @@ fn render_batch(frame: &mut ratatui::Frame, area: Rect, job: &BatchJob, theme: &
 }
 
 /// 宽范围作业的确认框。居中浮层，盖在底下那层上。
+/// 输入框的标题，按 intent 定。
+fn rename_prompt(intent: InputIntent) -> &'static str {
+    match intent {
+        InputIntent::RenameBook(_) => "重命名书",
+        InputIntent::RenameVolume(_) => "重命名卷",
+        InputIntent::RenameChapter(_) => "重命名章",
+    }
+}
+
+/// 单行输入框（§6.1/§6.2 改名）。居中小窗，自己 Clear。
+fn render_input(frame: &mut ratatui::Frame, area: Rect, input: &Input, theme: &Theme) {
+    use unicode_width::UnicodeWidthStr as _;
+    // 宽度按内容与提示语算，留出光标位；不小于 30 列。
+    let content_w = input.value().width().max(input.title().width()) as u16 + 6;
+    let w = content_w.clamp(30, area.width);
+    let h = 3u16.min(area.height); // 边框 2 + 一行输入
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} (Enter 确认 · Esc 取消) ", input.title()))
+        .border_style(Style::default().fg(theme.accent));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // 文本 + 一个块状光标，让人看得见在哪儿输入。
+    let line = Line::from(vec![
+        Span::raw(input.value().to_string()),
+        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
 /// 同意框（§6.8 [MUST]）。
 ///
 /// 这是唯一一个**截断即失效**的框：用户要据此决定把稿子发不发给第三方，
