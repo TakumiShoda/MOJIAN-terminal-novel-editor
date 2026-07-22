@@ -7,7 +7,7 @@
 //! ```
 
 use mj_core::config::Config;
-use mj_core::id::{BookId, ChapterId};
+use mj_core::id::{BookId, ChapterId, VolumeId};
 use mj_core::model::{Book, ChapterBody};
 use mj_core::store::Store;
 use ratatui::DefaultTerminal;
@@ -2392,6 +2392,71 @@ impl App {
         self.input = Some(Input::new(prompt, "", intent));
     }
 
+    /// `Alt+↑/↓`：把选中的章往上/下挪一位（§6.2 [MUST]「上下移动、跨卷移动」）。
+    ///
+    /// 一个动作管两件事：卷内相邻两章对调；到了卷边界就跨过去（下到下一卷的顶、
+    /// 上到上一卷的底）。于是同两个键就能把一章一路挪到全书任何位置，不必另开
+    /// 「移动到…」的选择框。
+    fn nudge_chapter(&mut self, up: bool) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        // 只对选中的是「章」时动作。
+        let Some(Row::Chapter { id: ch, .. }) = ws.tree.selected(&ws.book) else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+        // 找到 ch 所在卷、卷内下标，以及相邻卷。
+        let vols = &ws.book.volumes;
+        let Some(vi) = vols
+            .iter()
+            .position(|v| v.chapters.iter().any(|c| c.id == ch))
+        else {
+            return Ok(());
+        };
+        let sibs = &vols[vi].chapters;
+        let j = sibs.iter().position(|c| c.id == ch).unwrap_or(0);
+
+        // 算出目标卷 + 排在谁之后（after=None 表示排到卷首）。
+        let target: Option<(VolumeId, Option<ChapterId>)> = if up {
+            if j > 0 {
+                // 卷内上移：排到前一章之前 = 排在「前前一章」之后。
+                let after = if j >= 2 { Some(sibs[j - 2].id) } else { None };
+                Some((vols[vi].id, after))
+            } else if vi > 0 {
+                // 卷首再上：挪到上一卷的末尾。
+                let prev = &vols[vi - 1];
+                Some((prev.id, prev.chapters.last().map(|c| c.id)))
+            } else {
+                None // 已是全书第一章
+            }
+        } else if j + 1 < sibs.len() {
+            // 卷内下移：排到下一章之后。
+            Some((vols[vi].id, Some(sibs[j + 1].id)))
+        } else if vi + 1 < vols.len() {
+            // 卷尾再下：挪到下一卷的开头。
+            Some((vols[vi + 1].id, None))
+        } else {
+            None // 已是全书最后一章
+        };
+
+        let Some((target_vol, after)) = target else {
+            return Ok(());
+        };
+        if let Err(e) = self.store.move_chapter(book, ch, target_vol, after) {
+            self.toast = Some(format!("移动失败：{e}"));
+            return Ok(());
+        }
+        // 重载书树，并让光标跟着这一章走——好连着按 Alt+↓ 一路挪。
+        if let Ok(b) = self.store.load_book(book)
+            && let Screen::Workspace(ws) = &mut self.screen
+        {
+            ws.book = b;
+            ws.tree.focus_chapter(&ws.book, ch);
+        }
+        Ok(())
+    }
+
     /// 输入框吃键。返回 true 表示这一键被输入框消费了（`on_key` 据此提前返回）。
     fn input_handles_key(&mut self, code: KeyCode) -> anyhow::Result<bool> {
         let Some(input) = &mut self.input else {
@@ -2909,7 +2974,12 @@ impl App {
         }
     }
 
-    fn on_key_tree(&mut self, code: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
+    fn on_key_tree(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
+        // Alt+↑/↓：挪动选中的章（§6.2 [MUST]）。要 &mut self，先于下面的 ws 借用处理。
+        if mods.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Up | KeyCode::Down) {
+            return self.nudge_chapter(code == KeyCode::Up);
+        }
+
         let Screen::Workspace(ws) = &mut self.screen else {
             return Ok(());
         };
@@ -3425,6 +3495,14 @@ impl App {
     pub fn focus_tree_for_test(&mut self) {
         if let Screen::Workspace(ws) = &mut self.screen {
             ws.focus = Focus::Tree;
+        }
+    }
+
+    /// 供测试：把树光标定到某一章（挪动测试要选中不同的章）。
+    #[doc(hidden)]
+    pub fn select_chapter_for_test(&mut self, ch: ChapterId) {
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.tree.focus_chapter(&ws.book, ch);
         }
     }
 
