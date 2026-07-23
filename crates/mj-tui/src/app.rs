@@ -385,6 +385,11 @@ impl App {
                     self.dirty = true;
                 }
                 AppEvent::Term(Event::Resize(_, _)) => self.dirty = true,
+                // 粘贴整段一次到手（§2.3 [MUST]）——一次插入、一次重排。
+                AppEvent::Term(Event::Paste(s)) => {
+                    self.on_paste(s);
+                    self.dirty = true;
+                }
                 // 鼠标只在配置开了时才被捕获，走到这里就说明用户要它（§13）。
                 AppEvent::Term(Event::Mouse(m)) => {
                     self.toast = None;
@@ -401,6 +406,37 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// 粘贴（§2.3 [MUST]）。整段一次插入，不逐字符走 auto-pair / 补全——
+    /// 那些是给「敲字」用的，一次粘 3000 字不该触发 3000 次配对判断。
+    fn on_paste(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        // 输入框活着：粘的是名字，去掉换行（单行框容不下）后塞进去。
+        if let Some(input) = &mut self.input {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                input.input_char(c);
+            }
+            return;
+        }
+        // 编辑器聚焦才插入正文；别处（树/书架/浮层）忽略。
+        let Screen::Workspace(ws) = &mut self.screen else {
+            return;
+        };
+        if ws.focus != Focus::Editor || !ws.modals.is_empty() {
+            return;
+        }
+        let Some(open) = &mut ws.editor else {
+            return;
+        };
+        open.buffer.insert(&text);
+        // 收尾同「敲字后」那套：更新字数缓存、清校对下划线、算自动保存、滚到光标。
+        open.autosave.on_edit(std::time::Instant::now());
+        open.word_count = mj_text::count::count(&open.buffer.contents());
+        ws.proof_issues.clear();
+        open.viewport.scroll_to_cursor(&open.buffer);
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
@@ -3547,6 +3583,13 @@ impl App {
     /// 一个只在 demo 钩子里跑过的功能，等于没验证过用户按得到它。
     /// （Ctrl+Shift+S 那次就是这么漏的，见 doc.md §7.3。）
     #[doc(hidden)]
+    /// 供测试：送一个粘贴事件（§2.3）。
+    #[doc(hidden)]
+    pub fn paste_for_test(&mut self, text: &str) {
+        self.toast = None;
+        self.on_paste(text.to_string());
+    }
+
     pub fn press_for_test(&mut self, code: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {
         self.on_key(code, mods)
     }
@@ -3576,6 +3619,14 @@ impl App {
     pub fn focus_tree_for_test(&mut self) {
         if let Screen::Workspace(ws) = &mut self.screen {
             ws.focus = Focus::Tree;
+        }
+    }
+
+    /// 供测试：把焦点切到编辑器（正常靠在树里回车打开章才会切过去）。
+    #[doc(hidden)]
+    pub fn focus_editor_for_test(&mut self) {
+        if let Screen::Workspace(ws) = &mut self.screen {
+            ws.focus = Focus::Editor;
         }
     }
 
@@ -5484,6 +5535,14 @@ pub fn run(store: Store, config: Config) -> anyhow::Result<()> {
         app.note_keyboard_protocol();
     }
 
+    // Bracketed paste（§2.3 [MUST]）：让终端把「粘贴」整体作为一个 Paste 事件送来，
+    // 而不是拆成逐字符按键——否则粘 3000 字就是 3000 次按键、3000 次重排。
+    // 无条件开：它只改变粘贴的送达方式，不像鼠标捕获那样夺走终端已有能力。
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableBracketedPaste
+    );
+
     // 鼠标捕获（§13）。默认关——开了终端自己的拖选复制就没了，见 config 的注释。
     //
     // 关掉它是**必须做到**的事，不是收尾的客气：留着捕获退出去，用户的终端
@@ -5507,6 +5566,10 @@ pub fn run(store: Store, config: Config) -> anyhow::Result<()> {
             ratatui::crossterm::event::DisableMouseCapture
         );
     }
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableBracketedPaste
+    );
     crate::keyboard::disable();
     crate::font::emit_reset_sequence();
     ratatui::try_restore()?;
