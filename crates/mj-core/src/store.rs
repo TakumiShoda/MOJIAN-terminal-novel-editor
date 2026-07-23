@@ -497,6 +497,25 @@ impl Store {
         Ok(())
     }
 
+    /// 设章节状态（草稿/已改/定稿，§6.2）。状态不在文件名里，只改 front matter、
+    /// 重写文件，**正文与文件名都不动**。受损章拒绝改。
+    pub fn set_chapter_status(
+        &mut self,
+        book: BookId,
+        ch: ChapterId,
+        status: crate::model::ChapterStatus,
+    ) -> Result<()> {
+        let path = self.find_chapter_path(book, ch)?;
+        let raw = read_to_string(&path)?;
+        let mut file = ChapterFile::parse(&raw, ch).map_err(|e| Error::ChapterDamaged {
+            path: path.clone(),
+            message: e.to_string(),
+        })?;
+        file.meta.status = status;
+        file.meta.updated = Some(crate::now_rfc3339());
+        self.write_chapter_file(&path, &file)
+    }
+
     /// 删章：移到书内 `trash/chapters/`（§0 可撤销）。
     pub fn delete_chapter(&self, book: BookId, ch: ChapterId) -> Result<()> {
         let src = self.find_chapter_path(book, ch)?;

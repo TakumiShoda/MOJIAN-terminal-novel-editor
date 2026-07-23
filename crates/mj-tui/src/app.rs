@@ -2474,6 +2474,56 @@ impl App {
         self.open_input(prompt, "", intent);
     }
 
+    /// `s`：推进章节状态。勾选了就批量推进勾选的每一章（各自 +1 步），
+    /// 没勾选就推进当前选中那一章（§6.2 [MUST]）。
+    fn advance_status(&mut self) -> anyhow::Result<()> {
+        let Screen::Workspace(ws) = &self.screen else {
+            return Ok(());
+        };
+        let book = ws.book.id;
+
+        // 收集要改的 (章 id, 当前状态)。勾选优先；否则用选中的章。
+        let mut targets: Vec<(ChapterId, mj_core::model::ChapterStatus)> = Vec::new();
+        if ws.tree.checked().is_empty() {
+            if let Some(Row::Chapter { id, .. }) = ws.tree.selected(&ws.book)
+                && let Some((_, ch)) = ws.book.find_chapter(id)
+            {
+                targets.push((id, ch.status));
+            }
+        } else {
+            for v in &ws.book.volumes {
+                for c in &v.chapters {
+                    if ws.tree.checked().contains(&c.id) {
+                        targets.push((c.id, c.status));
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let n = targets.len();
+        for (id, cur) in targets {
+            if let Err(e) = self.store.set_chapter_status(book, id, cur.next()) {
+                self.toast = Some(format!("改状态失败：{e}"));
+                return Ok(());
+            }
+        }
+        // 磁盘变了，重载书树。
+        if let Ok(b) = self.store.load_book(book)
+            && let Screen::Workspace(ws) = &mut self.screen
+        {
+            ws.book = b;
+        }
+        self.toast = Some(if n == 1 {
+            "已推进该章状态".into()
+        } else {
+            format!("已推进 {n} 章的状态")
+        });
+        Ok(())
+    }
+
     /// `Alt+↑/↓`：把选中的章往上/下挪一位（§6.2 [MUST]「上下移动、跨卷移动」）。
     ///
     /// 一个动作管两件事：卷内相邻两章对调；到了卷边界就跨过去（下到下一卷的顶、
@@ -3103,10 +3153,16 @@ impl App {
 
         match code {
             KeyCode::Esc => {
-                // 回书架前先保存——不能让未保存的字随着切屏消失（§0 禁令 1）。
-                self.save_current()?;
-                let books = self.store.list_books()?;
-                self.screen = Screen::Shelf(Shelf::new(books));
+                // 有勾选就先清勾选（Esc 逐层退的语义）——别一下跳回书架，
+                // 让人以为多选的东西丢了。没勾选才回书架。
+                if !ws.tree.checked().is_empty() {
+                    ws.tree.clear_checks();
+                } else {
+                    // 回书架前先保存——不能让未保存的字随着切屏消失（§0 禁令 1）。
+                    self.save_current()?;
+                    let books = self.store.list_books()?;
+                    self.screen = Screen::Shelf(Shelf::new(books));
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => ws.tree.move_down(&ws.book),
             KeyCode::Up | KeyCode::Char('k') => ws.tree.move_up(),
@@ -3148,6 +3204,9 @@ impl App {
                 }
                 None => {}
             },
+            // `s`：推进章节状态（草稿→已改→定稿→草稿）。有勾选就批量推进勾选的，
+            // 否则推进选中那一章（§6.2 [MUST]：多选后批量改状态）。
+            KeyCode::Char('s') => return self.advance_status(),
             KeyCode::Left => ws.tree.toggle(&ws.book),
             KeyCode::Right | KeyCode::Enter => {
                 match ws.tree.selected(&ws.book) {
@@ -4082,6 +4141,23 @@ impl App {
                     spans.push(Span::raw(" 统计面板 │ e 导出 CSV │ ↑↓ 滚动 │ Esc 关闭 "));
                 }
                 Screen::Workspace(ws) => {
+                    // §6.2 [MUST]：树上勾选后，状态栏切为「选中 N 章 M 字」。
+                    // 勾选是在树里做的临时状态，此刻关心的是「勾了多少」。
+                    let checks = ws.tree.checked().len();
+                    if ws.focus == Focus::Tree && checks > 0 {
+                        let words = ws.tree.checked_words(&ws.book);
+                        spans.push(Span::styled(
+                            format!(" 选中 {checks} 章 {} 字 ", format_words(words)),
+                            Style::default().fg(theme.accent),
+                        ));
+                        spans.push(Span::raw("│ s 改状态 │ Space 增减 │ Esc 清空 "));
+                        frame.render_widget(
+                            Paragraph::new(Line::from(spans)).style(Style::default().reversed()),
+                            area,
+                        );
+                        return;
+                    }
+
                     // §6.4 [MUST]：选中文本时状态栏切为「选中 N 字」。
                     // 选区是临时状态，此刻用户关心的是「我选了多少」，
                     // 而不是本章/本卷/全书那一串常驻数字。

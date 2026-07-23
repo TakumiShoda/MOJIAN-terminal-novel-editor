@@ -309,6 +309,28 @@ fn unpin_and_unarchive() {
     assert!(!b.pinned && !b.archived, "取消后两个标志都该清掉");
 }
 
+/// 设状态：改 front matter、不动正文与文件名，跨重启还在（§6.2）。
+#[test]
+fn set_chapter_status_persists_without_touching_body() {
+    use mj_core::model::ChapterStatus;
+    let f = setup();
+    let body_before = f.store().load_body(f.book, f.ch1).unwrap().text.to_string();
+
+    f.store()
+        .set_chapter_status(f.book, f.ch1, ChapterStatus::Done)
+        .unwrap();
+
+    let b = f.store().load_book(f.book).unwrap();
+    let ch = b.volumes[0]
+        .chapters
+        .iter()
+        .find(|c| c.id == f.ch1)
+        .unwrap();
+    assert_eq!(ch.status, ChapterStatus::Done, "状态应已改到盘上");
+    let body_after = f.store().load_body(f.book, f.ch1).unwrap().text.to_string();
+    assert_eq!(body_after, body_before, "改状态不该碰正文");
+}
+
 /// 改名用带特殊字符/纯中文的标题也不能崩（slug 会退化，但文件名总要合法）。
 #[test]
 fn rename_with_tricky_titles_stays_loadable() {

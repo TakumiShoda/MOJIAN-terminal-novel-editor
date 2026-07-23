@@ -30,6 +30,24 @@ impl ChapterStatus {
             Self::Done => "●",
         }
     }
+
+    /// 中文名，给提示语用。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "草稿",
+            Self::Revised => "已改",
+            Self::Done => "定稿",
+        }
+    }
+
+    /// 下一个状态：草稿 → 已改 → 定稿 → 草稿（`s` 键循环推进用）。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Draft => Self::Revised,
+            Self::Revised => Self::Done,
+            Self::Done => Self::Draft,
+        }
+    }
 }
 
 /// 书。`volumes` 有序。
