@@ -54,6 +54,11 @@ struct BookToml {
     created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated: Option<String>,
+    /// 置顶/归档（§6.1）。默认 false，故老书读进来不受影响。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pinned: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    archived: bool,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -206,8 +211,25 @@ impl Store {
                 }
             }
         }
-        books.sort_by(|a, b| a.title.cmp(&b.title));
+        // 置顶的排最前、归档的沉最底，各组内按书名（§6.1）。
+        books.sort_by(|a, b| {
+            (a.archived, !a.pinned, &a.title).cmp(&(b.archived, !b.pinned, &b.title))
+        });
         Ok(books)
+    }
+
+    /// 置顶/取消置顶一本书（§6.1 [MUST]）。
+    pub fn set_book_pinned(&mut self, id: BookId, on: bool) -> Result<()> {
+        let mut b = self.load_book(id)?;
+        b.pinned = on;
+        self.save_book_meta(&b)
+    }
+
+    /// 归档/取消归档一本书（§6.1 [MUST]）。归档不删，只是从主视图沉下去。
+    pub fn set_book_archived(&mut self, id: BookId, on: bool) -> Result<()> {
+        let mut b = self.load_book(id)?;
+        b.archived = on;
+        self.save_book_meta(&b)
     }
 
     pub fn load_book(&self, id: BookId) -> Result<Book> {
@@ -234,6 +256,8 @@ impl Store {
             target_words: bt.target_words,
             created: bt.created.unwrap_or_default(),
             updated: bt.updated.unwrap_or_default(),
+            pinned: bt.pinned,
+            archived: bt.archived,
             volumes,
             extra: bt.extra,
         })
@@ -709,6 +733,8 @@ impl Store {
             target_words: book.target_words,
             created: Some(book.created.clone()),
             updated: Some(crate::now_rfc3339()),
+            pinned: book.pinned,
+            archived: book.archived,
             extra: book.extra.clone(),
         };
         let text = toml::to_string(&bt).map_err(|e| Error::ChapterParse {

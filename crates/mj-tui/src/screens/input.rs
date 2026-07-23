@@ -25,6 +25,10 @@ pub enum InputIntent {
     DeleteVolume(VolumeId),
     /// 删章：确认串是 `y`。
     DeleteChapter(ChapterId),
+    /// 建书向导第一步：收书名。提交后接着问作者。
+    NewBookTitle,
+    /// 建书向导第二步：收作者。提交后建书（附带第一卷第一章）。
+    NewBookAuthor,
 }
 
 pub struct Input {

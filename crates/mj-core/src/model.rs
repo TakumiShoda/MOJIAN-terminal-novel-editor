@@ -43,6 +43,10 @@ pub struct Book {
     pub target_words: Option<u64>,
     pub created: String,
     pub updated: String,
+    /// 置顶：书架上排到最前（§6.1 [MUST]）。
+    pub pinned: bool,
+    /// 归档：完成/搁置的书，书架上沉到最底、置灰，但不删（§6.1 [MUST]）。
+    pub archived: bool,
     pub volumes: Vec<Volume>,
     /// 未知字段透传，回写时保留（§5.3）。
     pub extra: toml::Table,
@@ -60,6 +64,8 @@ impl Book {
             target_words: None,
             created: now.clone(),
             updated: now,
+            pinned: false,
+            archived: false,
             volumes: Vec::new(),
             extra: toml::Table::new(),
         }

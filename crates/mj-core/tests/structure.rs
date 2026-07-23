@@ -231,6 +231,84 @@ fn move_chapter_across_volumes() {
     assert!(body.contains("第一章的正文"), "跨卷移动不该丢正文：{body}");
 }
 
+// ---- 置顶 / 归档（§6.1）----
+
+/// 置顶落盘、跨重启还在，且书架排序把它顶到最前。
+#[test]
+fn pin_persists_and_sorts_to_top() {
+    let f = setup();
+    // 再建两本，书名让默认排序把 setup 的「雪夜行」夹在中间。
+    let mut s = f.store();
+    let early = s.create_book("阿书", "作者").unwrap(); // 排最前
+    s.create_book("子书", "作者").unwrap(); // 排最后
+
+    // 置顶「子书」——它本该垫底，置顶后要窜到最前。
+    let zi = s
+        .list_books()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.title == "子书")
+        .unwrap();
+    s.set_book_pinned(zi.id, true).unwrap();
+
+    let store = f.store();
+    let names: Vec<String> = store
+        .list_books()
+        .unwrap()
+        .into_iter()
+        .map(|b| b.title)
+        .collect();
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("子书"),
+        "置顶的应最前：{names:?}"
+    );
+    // 没置顶的仍按书名。
+    assert!(
+        names.iter().position(|n| n == "阿书") < names.iter().position(|n| n == "雪夜行"),
+        "未置顶的仍按书名：{names:?}"
+    );
+    let _ = early;
+}
+
+/// 归档落盘、跨重启还在，且沉到书架最底。
+#[test]
+fn archive_persists_and_sorts_to_bottom() {
+    let f = setup();
+    let mut s = f.store();
+    s.create_book("阿书", "作者").unwrap();
+
+    // 归档「阿书」——它本该排最前，归档后沉到最底。
+    let a = s
+        .list_books()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.title == "阿书")
+        .unwrap();
+    s.set_book_archived(a.id, true).unwrap();
+
+    let store = f.store();
+    let books = store.list_books().unwrap();
+    let names: Vec<&str> = books.iter().map(|b| b.title.as_str()).collect();
+    assert_eq!(names.last(), Some(&"阿书"), "归档的应沉最底：{names:?}");
+    // 归档不删——书还在，archived 标着。
+    assert!(books.iter().find(|b| b.title == "阿书").unwrap().archived);
+}
+
+/// 取消置顶/归档也要生效。
+#[test]
+fn unpin_and_unarchive() {
+    let f = setup();
+    let mut s = f.store();
+    s.set_book_pinned(f.book, true).unwrap();
+    s.set_book_archived(f.book, true).unwrap();
+    s.set_book_pinned(f.book, false).unwrap();
+    s.set_book_archived(f.book, false).unwrap();
+
+    let b = f.store().load_book(f.book).unwrap();
+    assert!(!b.pinned && !b.archived, "取消后两个标志都该清掉");
+}
+
 /// 改名用带特殊字符/纯中文的标题也不能崩（slug 会退化，但文件名总要合法）。
 #[test]
 fn rename_with_tricky_titles_stays_loadable() {

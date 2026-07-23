@@ -174,12 +174,14 @@ pub struct App {
     events_tx: Option<std::sync::mpsc::Sender<AppEvent>>,
     /// 正按着分隔条拖（§13）。
     dragging_divider: bool,
-    /// 活动中的单行输入框（改名，§6.1/§6.2）。
+    /// 活动中的单行输入框（改名/删除确认/建书向导，§6.1/§6.2）。
     ///
     /// 放 App 顶层而非浮层栈：改书名是在**书架**上做的，而书架没有浮层栈；
     /// 一个顶层字段能同时盖住书架与工作区，比给两处各接一套输入省事得多。
     /// 它一旦是 Some，就抢在所有屏幕之前吃键（见 `on_key`）。
     input: Option<Input>,
+    /// 建书向导第一步收下的书名，等第二步的作者。
+    pending_book_title: Option<String>,
 }
 
 /// 在跑的那趟模型校对。
@@ -234,6 +236,7 @@ impl App {
             events_tx: None,
             dragging_divider: false,
             input: None,
+            pending_book_title: None,
         })
     }
 
@@ -447,7 +450,11 @@ impl App {
                     self.open_book(id)?;
                 }
             }
-            KeyCode::Char('n') => self.new_book()?,
+            // `n`：建书向导（§6.1 [MUST]：书名 → 作者）。
+            KeyCode::Char('n') => {
+                self.pending_book_title = None;
+                self.open_input("新建书 · 书名", "", InputIntent::NewBookTitle);
+            }
             // `r`：给选中的书改名（§6.1 [MUST]）。
             KeyCode::Char('r') => {
                 if let Some(book) = shelf.selected() {
@@ -466,23 +473,52 @@ impl App {
                     );
                 }
             }
+            // `p`：置顶/取消置顶（§6.1 [MUST]）。
+            KeyCode::Char('p') => {
+                if let Some(book) = shelf.selected() {
+                    let (id, on, title) = (book.id, !book.pinned, book.title.clone());
+                    self.toggle_book_flag(id, title, true, on)?;
+                }
+            }
+            // `a`：归档/取消归档（§6.1 [MUST]）。
+            KeyCode::Char('a') => {
+                if let Some(book) = shelf.selected() {
+                    let (id, on, title) = (book.id, !book.archived, book.title.clone());
+                    self.toggle_book_flag(id, title, false, on)?;
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    /// 新建书。M1 用固定标题——建书向导（§6.1）需要输入浮层，属 M6 的命令面板范畴。
-    fn new_book(&mut self) -> anyhow::Result<()> {
-        let book = self.store.create_book("新书", "佚名")?;
-        // 建一卷一章，否则新书打开是空的，用户无处下笔。
-        let vol = self.store.create_volume(book.id, "第一卷", None)?;
-        self.store.create_chapter(book.id, vol, "第一章", None)?;
-
-        let books = self.store.list_books()?;
-        if let Screen::Shelf(shelf) = &mut self.screen {
-            shelf.reload(books, Some(book.id));
+    /// 置顶/归档一本书（§6.1）。`pin` 为 true 改置顶，否则改归档；`on` 是目标值。
+    /// 改完重排书架，光标跟着这本书走（它可能因排序换了位置）。
+    fn toggle_book_flag(
+        &mut self,
+        id: BookId,
+        title: String,
+        pin: bool,
+        on: bool,
+    ) -> anyhow::Result<()> {
+        let result = if pin {
+            self.store.set_book_pinned(id, on)
+        } else {
+            self.store.set_book_archived(id, on)
+        };
+        match result {
+            Ok(()) => {
+                if let Ok(books) = self.store.list_books()
+                    && let Screen::Shelf(shelf) = &mut self.screen
+                {
+                    shelf.reload(books, Some(id));
+                }
+                let what = if pin { "置顶" } else { "归档" };
+                let verb = if on { what } else { "取消" };
+                self.toast = Some(format!("已{verb}《{title}》"));
+            }
+            Err(e) => self.toast = Some(format!("操作失败：{e}")),
         }
-        self.toast = Some("已新建《新书》".into());
         Ok(())
     }
 
@@ -2382,14 +2418,24 @@ impl App {
 
     // ---- 输入框：改名（§6.1、§6.2）----
 
+    /// 开一个输入框：自定义提示语 + 预填值 + intent。改名/删除/向导都用它。
+    fn open_input(
+        &mut self,
+        prompt: impl Into<String>,
+        initial: impl Into<String>,
+        intent: InputIntent,
+    ) {
+        self.input = Some(Input::new(prompt, initial, intent));
+    }
+
     /// 发起改名：预填原名，开输入框。
     fn start_rename(&mut self, title: impl Into<String>, intent: InputIntent) {
-        self.input = Some(Input::new(rename_prompt(intent), title, intent));
+        self.open_input(rename_prompt(intent), title, intent);
     }
 
     /// 发起删除确认：不预填，等用户敲确认串（书名 / `y`）。
     fn start_delete_confirm(&mut self, prompt: impl Into<String>, intent: InputIntent) {
-        self.input = Some(Input::new(prompt, "", intent));
+        self.open_input(prompt, "", intent);
     }
 
     /// `Alt+↑/↓`：把选中的章往上/下挪一位（§6.2 [MUST]「上下移动、跨卷移动」）。
@@ -2487,7 +2533,42 @@ impl App {
             InputIntent::DeleteBook(_)
             | InputIntent::DeleteVolume(_)
             | InputIntent::DeleteChapter(_) => self.submit_delete(value, intent),
+            InputIntent::NewBookTitle => {
+                if value.is_empty() {
+                    self.toast = Some("书名不能为空，未新建".into());
+                    return Ok(());
+                }
+                // 第一步收下书名，接着问作者（预填「佚名」）。
+                self.pending_book_title = Some(value.to_string());
+                self.open_input("新建书 · 作者", "佚名", InputIntent::NewBookAuthor);
+                Ok(())
+            }
+            InputIntent::NewBookAuthor => {
+                let title = self.pending_book_title.take().unwrap_or_default();
+                if title.is_empty() {
+                    return Ok(()); // 书名丢了（不该发生），安全退出
+                }
+                let author = if value.is_empty() { "佚名" } else { value };
+                self.create_book_with(&title, author)
+            }
         }
+    }
+
+    /// 建书向导落地：建书 + 顺手建第一卷第一章，回到书架并选中它。
+    ///
+    /// **总是建第一卷**：章只能挂在卷里，没有卷的书连一个字都写不进去，
+    /// 那个「是否建第一卷」的选择近乎恒为「是」；想要别的卷名，建完 `r` 改即可。
+    fn create_book_with(&mut self, title: &str, author: &str) -> anyhow::Result<()> {
+        let book = self.store.create_book(title, author)?;
+        let vol = self.store.create_volume(book.id, "第一卷", None)?;
+        self.store.create_chapter(book.id, vol, "第一章", None)?;
+        if let Ok(books) = self.store.list_books()
+            && let Screen::Shelf(shelf) = &mut self.screen
+        {
+            shelf.reload(books, Some(book.id));
+        }
+        self.toast = Some(format!("已新建《{title}》"));
+        Ok(())
     }
 
     /// 落地一次改名：调 store，刷新内存里的书树/书架。
@@ -4068,8 +4149,11 @@ fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf, theme: &T
     for (i, b) in shelf.books().iter().enumerate() {
         let s = Shelf::summary(b);
         let marker = if i == shelf.cursor() { "▶ " } else { "  " };
+        // 置顶顶个 📌，归档挂个 [归档]——一眼看出状态。
+        let pin = if b.pinned { "📌 " } else { "" };
+        let arch = if b.archived { "  [归档]" } else { "" };
         let mut line = format!(
-            "{marker}《{}》  {}  {} 卷 {} 章  {} 字",
+            "{marker}{pin}《{}》  {}  {} 卷 {} 章  {} 字{arch}",
             b.title,
             b.author,
             s.volumes,
@@ -4083,6 +4167,9 @@ fn render_shelf(frame: &mut ratatui::Frame, area: Rect, shelf: &Shelf, theme: &T
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
+        } else if b.archived {
+            // 归档的置灰——它还在，但不是你眼下在忙的。
+            Style::default().fg(theme.dim)
         } else {
             Style::default().fg(theme.fg)
         };
